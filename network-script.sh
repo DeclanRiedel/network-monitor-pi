@@ -1,5 +1,18 @@
 #!/bin/bash
 
+# Add at the beginning of the script
+set -euo pipefail
+
+handle_error() {
+    echo "Error: $1" >&2
+    exit 1
+}
+
+INTERFACE=$(ip -o link show | awk -F': ' '{print $2}' | grep -m 1 '^e')
+if [ -z "$INTERFACE" ]; then
+    handle_error "No ethernet interface found"
+fi
+
 # Configuration
 DATA_DIR="/var/log/network_monitor"
 DB_FILE="$DATA_DIR/network_data.db"
@@ -16,6 +29,9 @@ PROMISED_UPLOAD_MBPS=1
 
 # Ensure directories exist
 mkdir -p "$DATA_DIR"
+if ! touch "$DB_FILE" 2>/dev/null; then
+    handle_error "Cannot write to $DB_FILE"
+fi
 
 # Initialize SQLite database if not exists
 if [[ ! -f "$DB_FILE" ]]; then
@@ -58,10 +74,20 @@ scan_devices() {
   done <"$DATA_DIR/active_ips.txt" >>"$DATA_DIR/device_list.log"
 }
 
+check_dependencies() {
+    local dependencies=(sqlite3 arp-scan nmap tshark speedtest-cli jq dig curl ip)
+    for cmd in "${dependencies[@]}"; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            echo "Error: Required command '$cmd' not found. Please install it."
+            exit 1
+        fi
+    done
+}
+
 # Function to log traffic by IP
 log_traffic() {
   echo "Logging per-IP traffic..."
-  tshark -i eth0 -a duration:30 -q -z conv,ip | awk '{if ($1 ~ /^[0-9]+\./) print $1, $2, $3}' >"$DATA_DIR/traffic_stats.log"
+  tshark -i "$INTERFACE" -a duration:30 -q -z conv,ip | awk '{if ($1 ~ /^[0-9]+\./) print $1, $2, $3}' >"$DATA_DIR/traffic_stats.log"
 }
 
 # Function to log latency, packet loss, and per-IP upload/download
@@ -80,6 +106,11 @@ log_latency_and_speeds() {
     local upload_speed download_speed
     upload_speed=$(echo "$traffic_stats" | awk '{print $3}')  # Outgoing traffic
     download_speed=$(echo "$traffic_stats" | awk '{print $2}') # Incoming traffic
+    
+    if [ -z "$avg_latency" ] || [ -z "$packet_loss" ] || [ -z "$upload_speed" ] || [ -z "$download_speed" ]; then
+        echo "Warning: Missing data for IP $ip, skipping..."
+        continue
+    fi
     
     echo "$ip $avg_latency $packet_loss $upload_speed $download_speed"
   done <"$DATA_DIR/active_ips.txt" >"$DATA_DIR/ip_stats.log"
@@ -127,6 +158,42 @@ EOF
   done
 }
 
+# Function to test DNS performance
+test_dns_performance() {
+    echo "Testing DNS performance..."
+    local dns_servers=("8.8.8.8" "1.1.1.1" "9.9.9.9")
+    local timestamp
+    timestamp=$(date "+%Y-%m-%d %H:%M:%S")
+    
+    for dns in "${dns_servers[@]}"; do
+        local dns_time
+        dns_time=$(dig @"$dns" google.com | grep "Query time:" | awk '{print $4}')
+        
+        sqlite3 "$DB_FILE" <<EOF
+INSERT INTO network_stats (timestamp, ip, dns_time, protocol)
+VALUES ('$timestamp', '$dns', $dns_time, 'DNS');
+EOF
+    done
+}
+
+# Function to analyze network protocols
+analyze_protocols() {
+    echo "Analyzing network protocols..."
+    tshark -i "$INTERFACE" -a duration:30 -z io,phs \
+        | awk '/^[[:space:]]*[0-9]/ {print $2, $3}' \
+        > "$DATA_DIR/protocol_stats.log"
+    
+    local timestamp
+    timestamp=$(date "+%Y-%m-%d %H:%M:%S")
+    
+    while read -r protocol bytes; do
+        sqlite3 "$DB_FILE" <<EOF
+INSERT INTO network_stats (timestamp, protocol, traffic_rx)
+VALUES ('$timestamp', '$protocol', $bytes);
+EOF
+    done < "$DATA_DIR/protocol_stats.log"
+}
+
 # Periodic export to JSON
 export_json() {
   sqlite3 "$DB_FILE" "SELECT * FROM network_stats;" | jq -R -s -c 'split("\n") | .[:-1] | map(split("|"))' >"$PER_IP_JSON"
@@ -145,15 +212,46 @@ EOF
   done <"$DATA_DIR/ip_stats.log"
 }
 
+# Check disk space
+check_disk_space() {
+    local current_size
+    current_size=$(du -sm "$DATA_DIR" | cut -f1)
+    if [ "$current_size" -gt "$DISK_LIMIT_MB" ]; then
+        echo "Warning: Data directory exceeds size limit. Cleaning old files..."
+        find "$DATA_DIR" -type f -name "*.log" -mtime +30 -delete
+        find "$DATA_DIR" -type f -name "*.pcap" -mtime +7 -delete
+    fi
+}
+
 # Main routine
 main() {
-  scan_devices
-  log_traffic
-  log_latency_and_speeds
-  test_overall_network
-  test_throttling
-  save_to_db
-  export_json
+    local lock_file="/tmp/network_monitor.lock"
+    
+    # Prevent multiple instances
+    if ! mkdir "$lock_file" 2>/dev/null; then
+        echo "Script is already running"
+        exit 1
+    fi
+    
+    # Setup cleanup traps
+    trap 'rm -f "$DATA_DIR"/*.log; rm -rf "$lock_file"' EXIT INT TERM
+    
+    check_dependencies
+    rotate_database
+    check_disk_space
+    
+    scan_devices
+    log_traffic
+    log_latency_and_speeds
+    test_overall_network
+    test_throttling
+    test_dns_performance
+    analyze_protocols
+    save_to_db
+    export_json
+    
+    # Cleanup temporary files
+    find "$DATA_DIR" -name "*.log" -type f -mmin +60 -delete
 }
 
 main
