@@ -1064,17 +1064,9 @@ test_dns_performance() {
         lookup_time=0
     fi
     
-    # Write to JSON with error handling
-    if ! echo "{
-        \"timestamp\": \"$timestamp\",
-        \"lookup_time\": ${lookup_time:-0}
-    }" > "$DATA_DIR/dns_performance.json"; then
-        handle_function_error "test_dns_performance" "Failed to write JSON file"
-    fi
-    
     # Write to database with error handling
     if ! sqlite3 "$DB_FILE" <<EOF
-INSERT INTO network_stats (timestamp, dns_time)
+INSERT INTO dns_performance (timestamp, lookup_time)
 VALUES ('$timestamp', ${lookup_time:-0});
 EOF
     then
@@ -1154,3 +1146,4 @@ if ! main; then
     echo "Script failed with error $?" >&2
     exit 1
 fi
+
