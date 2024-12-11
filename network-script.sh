@@ -607,49 +607,86 @@ EOF
 
 # Main routine
 main() {
+    echo "Starting network monitoring script..."
+    
     # Create lock file directory if it doesn't exist
     sudo mkdir -p "$(dirname "${LOCK_FILE}")" 2>/dev/null || true
     
-    # Prevent multiple instances
+    # Prevent multiple instances using redirection instead of mkdir
     exec 9>"${LOCK_FILE}"
     if ! flock -n 9; then
         echo "Script is already running"
         exit 1
     fi
     
-    # Setup cleanup trap
+    # Setup cleanup traps
     trap 'rm -f "${LOCK_FILE}"; exec 9>&-' EXIT INT TERM
     
+    # Initial setup
     check_dependencies
     create_dirs_and_files
     init_database
     
+    echo "Initial setup completed. Starting monitoring loop..."
+    
+    # Main monitoring loop
     while true; do
         echo "======================================"
         echo "Starting network tests at $(date)"
         echo "Interface: $INTERFACE"
         echo "======================================"
         
-        check_disk_space
-        measure_connection_quality
-        test_dns_performance
-        test_throttling
-        monitor_bandwidth
+        # Run disk space check
+        check_disk_space || echo "Warning: Disk space check failed"
+        
+        # Run connection quality test
+        echo "Running connection quality test..."
+        measure_connection_quality || echo "Warning: Connection quality test failed"
+        
+        # Run DNS performance test
+        echo "Running DNS performance test..."
+        test_dns_performance || echo "Warning: DNS performance test failed"
+        
+        # Run throttling test
+        echo "Running throttling test..."
+        test_throttling || echo "Warning: Throttling test failed"
+        
+        # Monitor bandwidth
+        echo "Monitoring bandwidth..."
+        monitor_bandwidth || echo "Warning: Bandwidth monitoring failed"
         
         # Get latest measurements for spike and drop detection
+        echo "Checking for speed anomalies..."
         local latest
         latest=$(sqlite3 "$DB_FILE" "SELECT download_speed, upload_speed, latency 
             FROM network_stats ORDER BY timestamp DESC LIMIT 1;")
-        IFS='|' read -r current_download current_upload current_latency <<< "$latest"
         
-        detect_spikes "$current_download" "$current_upload" "$current_latency"
-        track_speed_drops "$current_download" "$current_upload"
+        if [ -n "$latest" ]; then
+            IFS='|' read -r current_download current_upload current_latency <<< "$latest"
+            
+            # Run spike and drop detection
+            detect_spikes "$current_download" "$current_upload" "$current_latency"
+            track_speed_drops "$current_download" "$current_upload"
+        else
+            echo "Warning: Could not get latest measurements"
+        fi
         
-        echo "Tests completed. Waiting 30 minutes before next run..."
+        echo "Tests completed at $(date)"
+        echo "Waiting 30 minutes before next run..."
         echo "======================================"
-        sleep 1800
+        
+        # Sleep for 30 minutes
+        sleep 1800 || {
+            echo "Sleep interrupted"
+            break
+        }
     done
+    
+    echo "Network monitoring completed"
 }
 
-# Start the script
-main
+# Start the script with error handling
+if ! main; then
+    echo "Script failed with error $?" >&2
+    exit 1
+fi
