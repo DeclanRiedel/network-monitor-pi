@@ -193,6 +193,51 @@ CREATE TABLE IF NOT EXISTS protocol_stats (
     udp_packets INTEGER,
     icmp_messages INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS connection_quality (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    packet_loss REAL,
+    jitter REAL,
+    tcp_connections INTEGER,
+    quality TEXT
+);
+
+CREATE TABLE IF NOT EXISTS speed_drops (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    start_time TEXT,
+    end_time TEXT,
+    duration_seconds INTEGER,
+    average_download REAL,
+    average_upload REAL,
+    promised_download REAL,
+    promised_upload REAL,
+    samples_count INTEGER,
+    percent_of_promised REAL
+);
+
+CREATE TABLE IF NOT EXISTS bandwidth_measurements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    rx_mbps REAL,
+    tx_mbps REAL,
+    total_mbps REAL
+);
+
+CREATE TABLE IF NOT EXISTS dns_performance (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    lookup_time REAL
+);
+
+CREATE TABLE IF NOT EXISTS network_alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    alert_type TEXT,
+    message TEXT,
+    severity TEXT
+);
 EOF
     echo "Database initialization completed"
 }
