@@ -208,6 +208,55 @@ monitor_bandwidth() {
     }" > "$BANDWIDTH_LOG"
 }
 
+
+# Function to test overall network performance
+test_overall_network() {
+    echo "Testing overall network performance..."
+    local speedtest_output
+    speedtest_output=$(speedtest-cli --json)
+    local download_speed upload_speed ping
+    download_speed=$(echo "$speedtest_output" | jq '.download' | awk '{print $1/1000000}') # Convert to Mbps
+    upload_speed=$(echo "$speedtest_output" | jq '.upload' | awk '{print $1/1000000}')   # Convert to Mbps
+    ping=$(echo "$speedtest_output" | jq '.ping')
+    
+    # Save to JSON
+    echo "{
+        \"timestamp\": \"$(date '+%Y-%m-%d %H:%M:%S')\",
+        \"download_speed_mbps\": $download_speed,
+        \"upload_speed_mbps\": $upload_speed,
+        \"latency_ms\": $ping,
+        \"promised_download_speed_mbps\": $PROMISED_DOWNLOAD_MBPS,
+        \"promised_upload_speed_mbps\": $PROMISED_UPLOAD_MBPS
+    }" > "$OVERALL_JSON"
+
+    # Save to database
+    sqlite3 "$DB_FILE" <<EOF
+INSERT INTO network_stats (timestamp, download_speed, upload_speed, latency)
+VALUES ('$(date '+%Y-%m-%d %H:%M:%S')', $download_speed, $upload_speed, $ping);
+EOF
+}
+
+# Check disk space
+check_disk_space() {
+    local current_size
+    current_size=$(du -sm "$DATA_DIR" | cut -f1)
+    if [ "$current_size" -gt "$DISK_LIMIT_MB" ]; then
+        echo "Warning: Data directory exceeds size limit. Cleaning old files..."
+        find "$DATA_DIR" -type f -name "*.log" -mtime +30 -delete
+        find "$DATA_DIR" -type f -name "*.pcap" -mtime +7 -delete
+    fi
+}
+
+check_dependencies() {
+    local dependencies=(sqlite3 speedtest-cli jq curl bc netstat ping)
+    for cmd in "${dependencies[@]}"; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            handle_error "Required command '$cmd' not found. Please install it."
+        fi
+    done
+}
+
+
 # Generate daily report
 generate_daily_report() {
     local report="$DAILY_REPORT"
