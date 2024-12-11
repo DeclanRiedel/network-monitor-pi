@@ -16,6 +16,11 @@ HOURLY_STATS="$DATA_DIR/hourly_stats.json"
 DAILY_REPORT="$DATA_DIR/daily_report.txt"
 DISK_LIMIT_MB=1024
 
+# Constants for promised speeds (in Mbps)
+PROMISED_DOWNLOAD=15
+PROMISED_UPLOAD=1
+THRESHOLD_PERCENT=30
+
 # Error handling
 handle_error() {
     echo "Error: $1" >&2
@@ -363,17 +368,23 @@ test_dns_performance() {
             echo "Testing DNS lookup for $domain using $dns_server..."
             local start_time=$(date +%s.%N)
             
-            if dig "@${dns_server}" "$domain" +short +timeout=2 >/dev/null 2>&1; then
+            # Add timeout and error handling to dig command
+            if timeout 5 dig "@${dns_server}" "$domain" +short +tries=1 >/dev/null 2>&1; then
                 local end_time=$(date +%s.%N)
-                local lookup_time=$(echo "$end_time - $start_time" | bc)
+                local lookup_time
+                lookup_time=$(echo "$end_time - $start_time" | bc 2>/dev/null || echo "0")
                 results+=("$domain,$dns_server,$lookup_time")
             else
+                echo "Warning: DNS lookup failed for $domain using $dns_server"
                 results+=("$domain,$dns_server,failed")
             fi
+            
+            # Add a small delay between tests
+            sleep 1
         done
     done
     
-    # Save results to JSON
+    # Save results to JSON with error handling
     {
         echo "{"
         echo "  \"timestamp\": \"$(date '+%Y-%m-%d %H:%M:%S')\","
@@ -386,10 +397,13 @@ test_dns_performance() {
             else
                 echo ","
             fi
+            if [ "$time" = "failed" ]; then
+                time="null"
+            fi
             echo "    {"
             echo "      \"domain\": \"$domain\","
             echo "      \"dns_server\": \"$server\","
-            echo "      \"lookup_time\": \"$time\""
+            echo "      \"lookup_time\": $time"
             echo -n "    }"
         done
         echo
@@ -397,29 +411,33 @@ test_dns_performance() {
         echo "}" 
     } > "$DNS_LOG"
     
-    # Calculate average lookup time
+    # Calculate average lookup time with error handling
     local total=0
     local count=0
     for result in "${results[@]}"; do
         IFS=',' read -r _ _ time <<< "$result"
-        if [ "$time" != "failed" ]; then
-            total=$(echo "$total + $time" | bc)
+        if [ "$time" != "failed" ] && [ "$time" != "null" ]; then
+            total=$(echo "$total + $time" | bc 2>/dev/null || echo "$total")
             ((count++))
         fi
     done
     
     local avg_lookup_time=0
     if [ $count -gt 0 ]; then
-        avg_lookup_time=$(echo "scale=3; $total / $count" | bc)
+        avg_lookup_time=$(echo "scale=3; $total / $count" | bc 2>/dev/null || echo "0")
     fi
     
-    # Save to database
-    sqlite3 "$DB_FILE" <<EOF
+    # Save to database with error handling
+    if ! sqlite3 "$DB_FILE" <<EOF
 INSERT INTO network_stats (timestamp, dns_time)
 VALUES ('$(date '+%Y-%m-%d %H:%M:%S')', $avg_lookup_time);
 EOF
+    then
+        echo "Warning: Failed to save DNS results to database"
+    fi
     
     echo "DNS performance testing completed"
+    return 0
 }
 
 # Function to detect and report spikes
@@ -469,6 +487,110 @@ EOF
     fi
 }
 
+# Function to track speed drops
+track_speed_drops() {
+    local current_download=$1
+    local current_upload=$2
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    
+    # Calculate thresholds
+    local download_threshold=$(echo "scale=2; $PROMISED_DOWNLOAD * $THRESHOLD_PERCENT / 100" | bc)
+    local upload_threshold=$(echo "scale=2; $PROMISED_UPLOAD * $THRESHOLD_PERCENT / 100" | bc)
+    
+    # Check if we're in a drop state
+    local drop_state_file="$DATA_DIR/drop_state.json"
+    local drop_history_file="$DATA_DIR/speed_drops_history.json"
+    
+    # Initialize drop history file if it doesn't exist
+    if [ ! -f "$drop_history_file" ]; then
+        echo "[]" > "$drop_history_file"
+    fi
+    
+    if [ "$(echo "$current_download < $download_threshold" | bc -l)" -eq 1 ] || \
+       [ "$(echo "$current_upload < $upload_threshold" | bc -l)" -eq 1 ]; then
+        
+        # Check if this is a new drop
+        if [ ! -f "$drop_state_file" ]; then
+            # Start new drop tracking
+            local drop_data=$(cat <<EOF
+{
+    "start_time": "$timestamp",
+    "start_download": $current_download,
+    "start_upload": $current_upload,
+    "promised_download": $PROMISED_DOWNLOAD,
+    "promised_upload": $PROMISED_UPLOAD,
+    "threshold_percent": $THRESHOLD_PERCENT,
+    "ongoing": true,
+    "samples": []
+}
+EOF
+)
+            echo "$drop_data" > "$drop_state_file"
+            
+            # Log the start of drop
+            echo "Speed drop detected at $timestamp" >> "$DATA_DIR/drops.log"
+        fi
+        
+        # Add sample to ongoing drop
+        local sample=$(cat <<EOF
+    {
+        "timestamp": "$timestamp",
+        "download": $current_download,
+        "upload": $current_upload
+    }
+EOF
+)
+        # Append sample to existing drop state
+        jq --arg sample "$sample" '.samples += [$sample]' "$drop_state_file" > "${drop_state_file}.tmp" && \
+        mv "${drop_state_file}.tmp" "$drop_state_file"
+        
+    elif [ -f "$drop_state_file" ]; then
+        # Drop has ended, finalize the record
+        local end_timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+        
+        # Calculate duration and averages
+        local drop_data=$(cat "$drop_state_file")
+        local start_time=$(echo "$drop_data" | jq -r '.start_time')
+        local duration_seconds=$(( $(date -d "$end_timestamp" +%s) - $(date -d "$start_time" +%s) ))
+        
+        # Calculate averages during the drop
+        local samples=$(echo "$drop_data" | jq '.samples')
+        local avg_download=$(echo "$samples" | jq '[.[].download] | add/length')
+        local avg_upload=$(echo "$samples" | jq '[.[].upload] | add/length')
+        
+        # Create final drop record
+        local final_record=$(cat <<EOF
+{
+    "start_time": "$start_time",
+    "end_time": "$end_timestamp",
+    "duration_seconds": $duration_seconds,
+    "duration_human": "$(printf '%dh:%dm:%ds' $(($duration_seconds/3600)) $(($duration_seconds%3600/60)) $(($duration_seconds%60)))",
+    "average_download": $avg_download,
+    "average_upload": $avg_upload,
+    "promised_download": $PROMISED_DOWNLOAD,
+    "promised_upload": $PROMISED_UPLOAD,
+    "samples_count": $(echo "$samples" | jq 'length'),
+    "percent_of_promised": $(echo "scale=2; $avg_download * 100 / $PROMISED_DOWNLOAD" | bc)
+}
+EOF
+)
+        # Append to history
+        jq --arg record "$final_record" '. += [$record]' "$drop_history_file" > "${drop_history_file}.tmp" && \
+        mv "${drop_history_file}.tmp" "$drop_history_file"
+        
+        # Remove drop state file
+        rm -f "$drop_state_file"
+        
+        # Log the end of drop
+        echo "Speed drop ended at $end_timestamp (Duration: $(printf '%dh:%dm:%ds' $(($duration_seconds/3600)) $(($duration_seconds%3600/60)) $(($duration_seconds%60))))" >> "$DATA_DIR/drops.log"
+        
+        # Send notification
+        if command -v notify-send >/dev/null 2>&1; then
+            notify-send "Network Speed Drop Ended" "Duration: $(printf '%dh:%dm:%ds' $(($duration_seconds/3600)) $(($duration_seconds%3600/60)) $(($duration_seconds%60)))\nAvg Download: ${avg_download}Mbps\nAvg Upload: ${avg_upload}Mbps"
+        fi
+    fi
+}
+
 # Main routine
 main() {
     # Create lock file directory if it doesn't exist
@@ -500,13 +622,14 @@ main() {
         test_throttling
         monitor_bandwidth
         
-        # Get latest measurements for spike detection
+        # Get latest measurements for spike and drop detection
         local latest
         latest=$(sqlite3 "$DB_FILE" "SELECT download_speed, upload_speed, latency 
             FROM network_stats ORDER BY timestamp DESC LIMIT 1;")
         IFS='|' read -r current_download current_upload current_latency <<< "$latest"
         
         detect_spikes "$current_download" "$current_upload" "$current_latency"
+        track_speed_drops "$current_download" "$current_upload"
         
         echo "Tests completed. Waiting 30 minutes before next run..."
         echo "======================================"
