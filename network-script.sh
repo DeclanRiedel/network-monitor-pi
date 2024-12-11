@@ -5,17 +5,7 @@ set -euo pipefail
 # Define lock file globally
 LOCK_FILE="/var/run/network_monitor.lock"
 
-handle_error() {
-    echo "Error: $1" >&2
-    exit 1
-}
-
-INTERFACE=$(ip -o link show | awk -F': ' '{print $2}' | grep -m 1 '^e')
-if [ -z "$INTERFACE" ]; then
-    handle_error "No ethernet interface found"
-fi
-
-# Configuration
+# Directory and file setup
 DATA_DIR="/var/log/network_monitor"
 DB_FILE="$DATA_DIR/network_data.db"
 OVERALL_JSON="$DATA_DIR/overall_export.json"
@@ -25,6 +15,19 @@ BANDWIDTH_LOG="$DATA_DIR/bandwidth_usage.json"
 HOURLY_STATS="$DATA_DIR/hourly_stats.json"
 DAILY_REPORT="$DATA_DIR/daily_report.txt"
 DISK_LIMIT_MB=1024
+
+# Error handling
+handle_error() {
+    echo "Error: $1" >&2
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - ERROR: $1" >> "$DATA_DIR/error.log"
+    exit 1
+}
+
+# Find ethernet interface
+INTERFACE=$(ip -o link show | awk -F': ' '{print $2}' | grep -m 1 '^e')
+if [ -z "$INTERFACE" ]; then
+    handle_error "No ethernet interface found"
+fi
 
 # Create all necessary directories and files
 create_dirs_and_files() {
@@ -37,7 +40,8 @@ create_dirs_and_files() {
         "$DAILY_REPORT"
     )
 
-    mkdir -p "$DATA_DIR"
+    sudo mkdir -p "$DATA_DIR"
+    sudo chown "$(whoami):$(whoami)" "$DATA_DIR"
     
     for file in "${files[@]}"; do
         if [ ! -f "$file" ]; then
@@ -47,7 +51,7 @@ create_dirs_and_files() {
     done
 }
 
-# Initialize SQLite database if not exists
+# Initialize SQLite database
 init_database() {
     if [[ ! -f "$DB_FILE" ]]; then
         sqlite3 "$DB_FILE" <<EOF
@@ -92,7 +96,7 @@ EOF
 measure_connection_quality() {
     echo "Measuring connection quality..."
     local ping_stats
-    ping_stats=$(ping -c 20 8.8.8.8 | grep -E 'rtt|packet loss')
+    ping_stats=$(ping -I "$INTERFACE" -c 20 8.8.8.8 | grep -E 'rtt|packet loss')
     
     local packet_loss
     packet_loss=$(echo "$ping_stats" | grep -oP '\d+(?=% packet loss)')
@@ -120,7 +124,18 @@ measure_connection_quality() {
         \"quality\": \"$quality\"
     }" > "$DATA_DIR/connection_quality.json"
     
-    return 0
+    # Save to database
+    sqlite3 "$DB_FILE" <<EOF
+INSERT INTO network_stats (
+    timestamp, packet_loss, jitter, tcp_connections, connection_quality
+) VALUES (
+    '$(date '+%Y-%m-%d %H:%M:%S')',
+    $packet_loss,
+    $jitter,
+    $tcp_conn,
+    '$quality'
+);
+EOF
 }
 
 # Enhanced throttling test
@@ -134,7 +149,7 @@ test_throttling() {
     echo "----------------------------------------" >> "$results"
     
     for server in "speed.cloudflare.com" "speedtest.googlefiber.net" "fast.com"; do
-        echo "Testing $server..." >> "$results"
+        echo "Testing $server..."
         local start_time
         start_time=$(date +%s.%N)
         
@@ -151,40 +166,43 @@ test_throttling() {
         local duration
         duration=$(echo "$end_time - $start_time" | bc)
         
-        local throttled
-        if (( $(echo "$download_speed < $PROMISED_DOWNLOAD_MBPS * 0.7" | bc -l) )); then
+        local throttled="No"
+        if (( $(echo "$download_speed < 15 * 0.7" | bc -l) )); then
             throttled="Yes"
-        else
-            throttled="No"
         fi
         
         echo "  Download Speed: ${download_speed} Mbps" >> "$results"
         echo "  Upload Speed: ${upload_speed} Mbps" >> "$results"
         echo "  Latency: ${latency} ms" >> "$results"
         echo "  Throttling Detected: ${throttled}" >> "$results"
-        echo "----------------------------------------" >> "$results"
         
+        # Save to database
         sqlite3 "$DB_FILE" <<EOF
 INSERT INTO throttling_tests (
     timestamp, test_type, server, latency, download_speed, 
     upload_speed, meets_promised_speed, throttle_detected, test_duration
 ) VALUES (
-    '$timestamp', 'CDN', '$server', $latency, $download_speed,
-    $upload_speed, 
-    $(echo "$download_speed >= $PROMISED_DOWNLOAD_MBPS" | bc),
+    '$timestamp',
+    'CDN',
+    '$server',
+    $latency,
+    $download_speed,
+    $upload_speed,
+    $(echo "$download_speed >= 15" | bc),
     $(echo "$throttled" | grep -q "Yes" && echo 1 || echo 0),
     $duration
 );
 EOF
     done
     
-    # Create human-readable JSON
+    # Create JSON summary
     jq -n --arg timestamp "$timestamp" --arg content "$(cat "$results")" \
         '{timestamp: $timestamp, results: $content}' > "$THROTTLING_JSON"
 }
 
-# Function to monitor bandwidth usage
+# Monitor bandwidth usage
 monitor_bandwidth() {
+    echo "Monitoring bandwidth usage..."
     local interval=60  # 1 minute
     local rx_bytes_start tx_bytes_start
     read -r rx_bytes_start < "/sys/class/net/$INTERFACE/statistics/rx_bytes"
@@ -197,8 +215,8 @@ monitor_bandwidth() {
     read -r tx_bytes_end < "/sys/class/net/$INTERFACE/statistics/tx_bytes"
     
     local rx_rate tx_rate
-    rx_rate=$(echo "scale=2; ($rx_bytes_end - $rx_bytes_start) / $interval / 125000" | bc)  # Convert to Mbps
-    tx_rate=$(echo "scale=2; ($tx_bytes_end - $tx_bytes_start) / $interval / 125000" | bc)  # Convert to Mbps
+    rx_rate=$(echo "scale=2; ($rx_bytes_end - $rx_bytes_start) / $interval / 125000" | bc)
+    tx_rate=$(echo "scale=2; ($tx_bytes_end - $tx_bytes_start) / $interval / 125000" | bc)
     
     echo "{
         \"timestamp\": \"$(date '+%Y-%m-%d %H:%M:%S')\",
@@ -208,34 +226,6 @@ monitor_bandwidth() {
     }" > "$BANDWIDTH_LOG"
 }
 
-
-# Function to test overall network performance
-test_overall_network() {
-    echo "Testing overall network performance..."
-    local speedtest_output
-    speedtest_output=$(speedtest-cli --json)
-    local download_speed upload_speed ping
-    download_speed=$(echo "$speedtest_output" | jq '.download' | awk '{print $1/1000000}') # Convert to Mbps
-    upload_speed=$(echo "$speedtest_output" | jq '.upload' | awk '{print $1/1000000}')   # Convert to Mbps
-    ping=$(echo "$speedtest_output" | jq '.ping')
-    
-    # Save to JSON
-    echo "{
-        \"timestamp\": \"$(date '+%Y-%m-%d %H:%M:%S')\",
-        \"download_speed_mbps\": $download_speed,
-        \"upload_speed_mbps\": $upload_speed,
-        \"latency_ms\": $ping,
-        \"promised_download_speed_mbps\": $PROMISED_DOWNLOAD_MBPS,
-        \"promised_upload_speed_mbps\": $PROMISED_UPLOAD_MBPS
-    }" > "$OVERALL_JSON"
-
-    # Save to database
-    sqlite3 "$DB_FILE" <<EOF
-INSERT INTO network_stats (timestamp, download_speed, upload_speed, latency)
-VALUES ('$(date '+%Y-%m-%d %H:%M:%S')', $download_speed, $upload_speed, $ping);
-EOF
-}
-
 # Check disk space
 check_disk_space() {
     local current_size
@@ -243,50 +233,8 @@ check_disk_space() {
     if [ "$current_size" -gt "$DISK_LIMIT_MB" ]; then
         echo "Warning: Data directory exceeds size limit. Cleaning old files..."
         find "$DATA_DIR" -type f -name "*.log" -mtime +30 -delete
-        find "$DATA_DIR" -type f -name "*.pcap" -mtime +7 -delete
+        find "$DATA_DIR" -type f -name "*.json" -mtime +30 -delete
     fi
-}
-
-check_dependencies() {
-    local dependencies=(sqlite3 speedtest-cli jq curl bc netstat ping)
-    for cmd in "${dependencies[@]}"; do
-        if ! command -v "$cmd" >/dev/null 2>&1; then
-            handle_error "Required command '$cmd' not found. Please install it."
-        fi
-    done
-}
-
-
-# Generate daily report
-generate_daily_report() {
-    local report="$DAILY_REPORT"
-    echo "Network Performance Report - $(date '+%Y-%m-%d')" > "$report"
-    echo "================================================" >> "$report"
-    
-    # Average speeds
-    sqlite3 "$DB_FILE" <<EOF >> "$report"
-.mode column
-.headers on
-SELECT 
-    round(avg(download_speed), 2) as avg_download_mbps,
-    round(avg(upload_speed), 2) as avg_upload_mbps,
-    round(avg(latency), 2) as avg_latency_ms,
-    round(avg(packet_loss), 2) as avg_packet_loss_percent
-FROM network_stats
-WHERE timestamp >= datetime('now', '-24 hours');
-EOF
-    
-    echo -e "\nThrottling Incidents Today:" >> "$report"
-    sqlite3 "$DB_FILE" <<EOF >> "$report"
-SELECT 
-    timestamp,
-    server,
-    round(download_speed, 2) as download_mbps,
-    case when throttle_detected = 1 then 'Yes' else 'No' end as throttled
-FROM throttling_tests
-WHERE timestamp >= datetime('now', '-24 hours')
-AND throttle_detected = 1;
-EOF
 }
 
 # Main routine
@@ -294,29 +242,36 @@ main() {
     # Create lock file directory if it doesn't exist
     sudo mkdir -p "$(dirname "${LOCK_FILE}")" 2>/dev/null || true
     
-    # Prevent multiple instances using redirection instead of mkdir
+    # Prevent multiple instances
     exec 9>"${LOCK_FILE}"
     if ! flock -n 9; then
         echo "Script is already running"
         exit 1
     fi
     
-    # Setup cleanup traps
+    # Setup cleanup trap
     trap 'rm -f "${LOCK_FILE}"; exec 9>&-' EXIT INT TERM
     
     check_dependencies
     create_dirs_and_files
     init_database
-    check_disk_space
     
-    test_overall_network
-    test_throttling
-    test_dns_performance
-    measure_connection_quality
-    monitor_bandwidth
-    generate_daily_report
-    
-    echo "Network monitoring completed successfully"
+    while true; do
+        echo "======================================"
+        echo "Starting network tests at $(date)"
+        echo "Interface: $INTERFACE"
+        echo "======================================"
+        
+        check_disk_space
+        measure_connection_quality
+        test_throttling
+        monitor_bandwidth
+        
+        echo "Tests completed. Waiting 30 minutes before next run..."
+        echo "======================================"
+        sleep 1800
+    done
 }
 
+# Start the script
 main
