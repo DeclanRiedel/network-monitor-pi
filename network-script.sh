@@ -319,6 +319,156 @@ check_disk_space() {
     fi
 }
 
+# Function to check for required tools
+check_dependencies() {
+    local dependencies=(
+        "sqlite3"
+        "speedtest-cli"
+        "jq"
+        "curl"
+        "bc"
+        "netstat"
+        "ping"
+        "dig"
+        "ip"
+        "awk"
+        "grep"
+    )
+    
+    local missing_deps=0
+    for cmd in "${dependencies[@]}"; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            echo "Missing dependency: $cmd"
+            missing_deps=1
+        fi
+    done
+    
+    if [ $missing_deps -eq 1 ]; then
+        echo "Please install missing dependencies using:"
+        echo "sudo apt-get update"
+        echo "sudo apt-get install sqlite3 speedtest-cli jq curl bc net-tools dnsutils iproute2"
+        handle_error "Missing dependencies"
+    fi
+}
+
+# Function to test DNS performance
+test_dns_performance() {
+    echo "Testing DNS performance..."
+    local domains=("google.com" "cloudflare.com" "amazon.com" "microsoft.com")
+    local dns_servers=("8.8.8.8" "1.1.1.1" "9.9.9.9")
+    local results=()
+    
+    for domain in "${domains[@]}"; do
+        for dns_server in "${dns_servers[@]}"; do
+            echo "Testing DNS lookup for $domain using $dns_server..."
+            local start_time=$(date +%s.%N)
+            
+            if dig "@${dns_server}" "$domain" +short +timeout=2 >/dev/null 2>&1; then
+                local end_time=$(date +%s.%N)
+                local lookup_time=$(echo "$end_time - $start_time" | bc)
+                results+=("$domain,$dns_server,$lookup_time")
+            else
+                results+=("$domain,$dns_server,failed")
+            fi
+        done
+    done
+    
+    # Save results to JSON
+    {
+        echo "{"
+        echo "  \"timestamp\": \"$(date '+%Y-%m-%d %H:%M:%S')\","
+        echo "  \"lookups\": ["
+        local first=true
+        for result in "${results[@]}"; do
+            IFS=',' read -r domain server time <<< "$result"
+            if [ "$first" = true ]; then
+                first=false
+            else
+                echo ","
+            fi
+            echo "    {"
+            echo "      \"domain\": \"$domain\","
+            echo "      \"dns_server\": \"$server\","
+            echo "      \"lookup_time\": \"$time\""
+            echo -n "    }"
+        done
+        echo
+        echo "  ]"
+        echo "}" 
+    } > "$DNS_LOG"
+    
+    # Calculate average lookup time
+    local total=0
+    local count=0
+    for result in "${results[@]}"; do
+        IFS=',' read -r _ _ time <<< "$result"
+        if [ "$time" != "failed" ]; then
+            total=$(echo "$total + $time" | bc)
+            ((count++))
+        fi
+    done
+    
+    local avg_lookup_time=0
+    if [ $count -gt 0 ]; then
+        avg_lookup_time=$(echo "scale=3; $total / $count" | bc)
+    fi
+    
+    # Save to database
+    sqlite3 "$DB_FILE" <<EOF
+INSERT INTO network_stats (timestamp, dns_time)
+VALUES ('$(date '+%Y-%m-%d %H:%M:%S')', $avg_lookup_time);
+EOF
+    
+    echo "DNS performance testing completed"
+}
+
+# Function to detect and report spikes
+detect_spikes() {
+    local current_download=$1
+    local current_upload=$2
+    local current_latency=$3
+    
+    # Get averages from the last hour
+    local averages
+    averages=$(sqlite3 "$DB_FILE" <<EOF
+SELECT 
+    avg(download_speed) as avg_download,
+    avg(upload_speed) as avg_upload,
+    avg(latency) as avg_latency
+FROM network_stats
+WHERE timestamp >= datetime('now', '-1 hour');
+EOF
+)
+    
+    local avg_download avg_upload avg_latency
+    IFS='|' read -r avg_download avg_upload avg_latency <<< "$averages"
+    
+    # Define spike thresholds (50% deviation from average)
+    local spike_detected=false
+    local spike_message=""
+    
+    if [ "$(echo "$current_download < $avg_download * 0.5" | bc -l)" -eq 1 ]; then
+        spike_detected=true
+        spike_message+="Download speed dropped significantly. "
+    fi
+    
+    if [ "$(echo "$current_upload < $avg_upload * 0.5" | bc -l)" -eq 1 ]; then
+        spike_detected=true
+        spike_message+="Upload speed dropped significantly. "
+    fi
+    
+    if [ "$(echo "$current_latency > $avg_latency * 2" | bc -l)" -eq 1 ]; then
+        spike_detected=true
+        spike_message+="Latency increased significantly. "
+    fi
+    
+    if [ "$spike_detected" = true ]; then
+        local alert_message="ALERT: Network performance spike detected at $(date '+%Y-%m-%d %H:%M:%S')\n$spike_message"
+        echo -e "$alert_message" >> "$DATA_DIR/alerts.log"
+        echo -e "$alert_message"
+    fi
+}
+
 # Main routine
 main() {
     # Create lock file directory if it doesn't exist
@@ -346,8 +496,17 @@ main() {
         
         check_disk_space
         measure_connection_quality
+        test_dns_performance
         test_throttling
         monitor_bandwidth
+        
+        # Get latest measurements for spike detection
+        local latest
+        latest=$(sqlite3 "$DB_FILE" "SELECT download_speed, upload_speed, latency 
+            FROM network_stats ORDER BY timestamp DESC LIMIT 1;")
+        IFS='|' read -r current_download current_upload current_latency <<< "$latest"
+        
+        detect_spikes "$current_download" "$current_upload" "$current_latency"
         
         echo "Tests completed. Waiting 30 minutes before next run..."
         echo "======================================"
