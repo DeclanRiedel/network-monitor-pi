@@ -53,43 +53,55 @@ create_dirs_and_files() {
 
 # Initialize SQLite database
 init_database() {
+    echo "Initializing database..."
+    # Ensure directory exists
+    mkdir -p "$(dirname "$DB_FILE")"
+    
+    # Create database with proper permissions
     if [[ ! -f "$DB_FILE" ]]; then
-        sqlite3 "$DB_FILE" <<EOF
+        touch "$DB_FILE"
+        chmod 666 "$DB_FILE"
+        
+        sqlite3 "$DB_FILE" <<'EOF'
 CREATE TABLE IF NOT EXISTS network_stats (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp TEXT NOT NULL,
-    download_speed REAL,
-    upload_speed REAL,
-    latency REAL,
-    jitter REAL,
-    packet_loss REAL,
-    dns_time REAL,
-    bandwidth_usage REAL,
-    tcp_connections INTEGER,
+    download_speed REAL DEFAULT 0,
+    upload_speed REAL DEFAULT 0,
+    latency REAL DEFAULT 0,
+    jitter REAL DEFAULT 0,
+    packet_loss REAL DEFAULT 0,
+    dns_time REAL DEFAULT 0,
+    bandwidth_usage REAL DEFAULT 0,
+    tcp_connections INTEGER DEFAULT 0,
     connection_quality TEXT
 );
 
 CREATE TABLE IF NOT EXISTS throttling_tests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp TEXT NOT NULL,
     test_type TEXT,
     server TEXT,
-    latency REAL,
-    download_speed REAL,
-    upload_speed REAL,
-    meets_promised_speed BOOLEAN,
-    throttle_detected BOOLEAN,
-    test_duration REAL
+    latency REAL DEFAULT 0,
+    download_speed REAL DEFAULT 0,
+    upload_speed REAL DEFAULT 0,
+    meets_promised_speed INTEGER DEFAULT 0,
+    throttle_detected INTEGER DEFAULT 0,
+    test_duration REAL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS hourly_stats (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     hour TEXT NOT NULL,
-    avg_download REAL,
-    avg_upload REAL,
-    avg_latency REAL,
-    peak_bandwidth REAL,
-    connection_drops INTEGER
+    avg_download REAL DEFAULT 0,
+    avg_upload REAL DEFAULT 0,
+    avg_latency REAL DEFAULT 0,
+    peak_bandwidth REAL DEFAULT 0,
+    connection_drops INTEGER DEFAULT 0
 );
 EOF
     fi
+    echo "Database initialization completed"
 }
 
 # Function to measure connection quality
@@ -108,12 +120,12 @@ measure_connection_quality() {
         # Extract packet loss with fallback
         packet_loss=$(echo "$ping_stats" | grep -oP '\d+(?=% packet loss)' || echo "100")
         
-        # Extract jitter with fallback
-        jitter=$(echo "$ping_stats" | awk -F '/' '{print $7}' || echo "0")
+        # Extract jitter with fallback (remove 'ms' and handle floating point)
+        jitter=$(echo "$ping_stats" | awk -F '/' '{gsub(/ms/,"",$7); print $7}' || echo "0")
     fi
 
     # Get TCP connections with error handling
-    if ! tcp_conn=$(netstat -tn | grep ESTABLISHED | wc -l); then
+    if ! tcp_conn=$(netstat -ant | grep ESTABLISHED | wc -l 2>/dev/null); then
         tcp_conn=0
         echo "Warning: Could not get TCP connection count"
     fi
@@ -131,28 +143,39 @@ measure_connection_quality() {
     fi
 
     # Create JSON output with error handling
-    echo "{
-        \"timestamp\": \"$(date '+%Y-%m-%d %H:%M:%S')\",
-        \"packet_loss\": $packet_loss,
-        \"jitter\": ${jitter:-0},
-        \"tcp_connections\": $tcp_conn,
-        \"quality\": \"$quality\"
-    }" > "$DATA_DIR/connection_quality.json"
+    local json_data
+    json_data=$(cat <<EOF
+{
+    "timestamp": "$(date '+%Y-%m-%d %H:%M:%S')",
+    "packet_loss": ${packet_loss},
+    "jitter": ${jitter},
+    "tcp_connections": ${tcp_conn},
+    "quality": "${quality}"
+}
+EOF
+)
+    echo "$json_data" > "$DATA_DIR/connection_quality.json"
 
     # Save to database with error handling
     if ! sqlite3 "$DB_FILE" <<EOF
 INSERT INTO network_stats (
-    timestamp, packet_loss, jitter, tcp_connections, connection_quality
+    timestamp,
+    packet_loss,
+    jitter,
+    tcp_connections,
+    connection_quality
 ) VALUES (
     '$(date '+%Y-%m-%d %H:%M:%S')',
-    $packet_loss,
-    ${jitter:-0},
-    $tcp_conn,
-    '$quality'
+    ${packet_loss},
+    ${jitter},
+    ${tcp_conn},
+    '${quality}'
 );
 EOF
     then
-        echo "Warning: Failed to save to database"
+        echo "Warning: Failed to save to database. Error: $?"
+        echo "Attempting to create tables..."
+        init_database
     fi
 
     echo "Connection quality measurement completed"
@@ -168,6 +191,20 @@ test_throttling() {
     local results="$DATA_DIR/throttle_results.txt"
     echo "ISP Throttling Test Results - $timestamp" > "$results"
     echo "----------------------------------------" >> "$results"
+    
+    # Ensure the throttling_tests table exists
+    sqlite3 "$DB_FILE" "CREATE TABLE IF NOT EXISTS throttling_tests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        test_type TEXT,
+        server TEXT,
+        latency REAL DEFAULT 0,
+        download_speed REAL DEFAULT 0,
+        upload_speed REAL DEFAULT 0,
+        meets_promised_speed INTEGER DEFAULT 0,
+        throttle_detected INTEGER DEFAULT 0,
+        test_duration REAL DEFAULT 0
+    );"
     
     for server in "speed.cloudflare.com" "speedtest.googlefiber.net" "fast.com"; do
         echo "Testing $server..."
@@ -192,16 +229,26 @@ test_throttling() {
             throttled="Yes"
         fi
         
-        echo "  Download Speed: ${download_speed} Mbps" >> "$results"
-        echo "  Upload Speed: ${upload_speed} Mbps" >> "$results"
-        echo "  Latency: ${latency} ms" >> "$results"
-        echo "  Throttling Detected: ${throttled}" >> "$results"
+        # Save results to text file
+        {
+            echo "  Download Speed: ${download_speed} Mbps"
+            echo "  Upload Speed: ${upload_speed} Mbps"
+            echo "  Latency: ${latency} ms"
+            echo "  Throttling Detected: ${throttled}"
+        } >> "$results"
         
-        # Save to database
-        sqlite3 "$DB_FILE" <<EOF
+        # Save to database with error handling
+        if ! sqlite3 "$DB_FILE" <<EOF
 INSERT INTO throttling_tests (
-    timestamp, test_type, server, latency, download_speed, 
-    upload_speed, meets_promised_speed, throttle_detected, test_duration
+    timestamp,
+    test_type,
+    server,
+    latency,
+    download_speed,
+    upload_speed,
+    meets_promised_speed,
+    throttle_detected,
+    test_duration
 ) VALUES (
     '$timestamp',
     'CDN',
@@ -214,6 +261,9 @@ INSERT INTO throttling_tests (
     $duration
 );
 EOF
+        then
+            echo "Warning: Failed to save throttling test to database for $server"
+        fi
     done
     
     # Create JSON summary
