@@ -206,18 +206,26 @@ test_throttling() {
         test_duration REAL DEFAULT 0
     );"
     
-    for server in "speed.cloudflare.com" "speedtest.googlefiber.net" "fast.com"; do
+    for server in "speed.cloudflare.com" "speedtest.googlefiber.net"; do
         echo "Testing $server..."
         local start_time
         start_time=$(date +%s.%N)
         
         local curl_output
-        curl_output=$(curl -w "%{speed_download},%{speed_upload},%{time_total}\n" -o /dev/null -s "https://$server")
+        if ! curl_output=$(curl -w "%{speed_download},%{speed_upload},%{time_total}\n" -o /dev/null -s --max-time 30 "https://$server" 2>/dev/null); then
+            echo "Warning: Failed to test $server, skipping..."
+            continue
+        fi
         
         local download_speed upload_speed latency
         download_speed=$(echo "$curl_output" | cut -d',' -f1)
         upload_speed=$(echo "$curl_output" | cut -d',' -f2)
         latency=$(echo "$curl_output" | cut -d',' -f3)
+        
+        # Validate the values
+        download_speed=${download_speed:-0}
+        upload_speed=${upload_speed:-0}
+        latency=${latency:-0}
         
         local end_time
         end_time=$(date +%s.%N)
@@ -235,6 +243,7 @@ test_throttling() {
             echo "  Upload Speed: ${upload_speed} Mbps"
             echo "  Latency: ${latency} ms"
             echo "  Throttling Detected: ${throttled}"
+            echo "----------------------------------------"
         } >> "$results"
         
         # Save to database with error handling
@@ -269,6 +278,8 @@ EOF
     # Create JSON summary
     jq -n --arg timestamp "$timestamp" --arg content "$(cat "$results")" \
         '{timestamp: $timestamp, results: $content}' > "$THROTTLING_JSON"
+    
+    echo "Throttling tests completed"
 }
 
 # Monitor bandwidth usage
