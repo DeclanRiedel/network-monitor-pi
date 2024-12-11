@@ -224,12 +224,16 @@ measure_connection_quality() {
     fi
 
     # Determine quality with more defensive checks
+    # Convert floating point values to integers for comparison
     packet_loss=${packet_loss:-100}  # Default to 100 if empty
     jitter=${jitter:-1000}          # Default to 1000 if empty
+    
+    # Round jitter to nearest integer for comparison
+    jitter_int=${jitter%.*}
 
-    if [ "${packet_loss}" -lt 1 ] && [ "${jitter%.*}" -lt 10 ]; then
+    if [ "${packet_loss}" -lt 1 ] && [ "${jitter_int}" -lt 10 ]; then
         quality="Excellent"
-    elif [ "${packet_loss}" -lt 5 ] && [ "${jitter%.*}" -lt 30 ]; then
+    elif [ "${packet_loss}" -lt 5 ] && [ "${jitter_int}" -lt 30 ]; then
         quality="Good"
     else
         quality="Poor"
