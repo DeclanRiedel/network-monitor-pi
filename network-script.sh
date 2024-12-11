@@ -366,23 +366,40 @@ test_dns_performance() {
     for domain in "${domains[@]}"; do
         for dns_server in "${dns_servers[@]}"; do
             echo "Testing DNS lookup for $domain using $dns_server..."
-            local start_time=$(date +%s.%N)
+            local start_time
+            local end_time
+            local lookup_time
             
-            # Add timeout and error handling to dig command
-            if timeout 5 dig "@${dns_server}" "$domain" +short +tries=1 >/dev/null 2>&1; then
-                local end_time=$(date +%s.%N)
-                local lookup_time
+            # Ensure start_time is captured
+            start_time=$(date +%s.%N) || start_time=$(date +%s)
+            
+            # Use timeout to prevent hanging
+            if timeout 3 dig "@${dns_server}" "$domain" +short +tries=1 +time=2 >/dev/null 2>&1; then
+                # Ensure end_time is captured
+                end_time=$(date +%s.%N) || end_time=$(date +%s)
                 lookup_time=$(echo "$end_time - $start_time" | bc 2>/dev/null || echo "0")
-                results+=("$domain,$dns_server,$lookup_time")
+                
+                # Validate lookup_time
+                if [[ ! "$lookup_time" =~ ^[0-9]*\.?[0-9]*$ ]]; then
+                    lookup_time="0"
+                fi
+                
+                echo "Lookup successful: ${lookup_time}s"
             else
                 echo "Warning: DNS lookup failed for $domain using $dns_server"
-                results+=("$domain,$dns_server,failed")
+                lookup_time="0"
             fi
             
-            # Add a small delay between tests
-            sleep 1
+            results+=("$domain,$dns_server,$lookup_time")
+            sleep 0.5  # Small delay between queries
         done
     done
+    
+    # Ensure we have results before proceeding
+    if [ ${#results[@]} -eq 0 ]; then
+        echo "Warning: No DNS results collected"
+        return 0
+    fi
     
     # Save results to JSON with error handling
     {
@@ -397,9 +414,6 @@ test_dns_performance() {
             else
                 echo ","
             fi
-            if [ "$time" = "failed" ]; then
-                time="null"
-            fi
             echo "    {"
             echo "      \"domain\": \"$domain\","
             echo "      \"dns_server\": \"$server\","
@@ -408,7 +422,7 @@ test_dns_performance() {
         done
         echo
         echo "  ]"
-        echo "}" 
+        echo "}"
     } > "$DNS_LOG"
     
     # Calculate average lookup time with error handling
@@ -416,7 +430,7 @@ test_dns_performance() {
     local count=0
     for result in "${results[@]}"; do
         IFS=',' read -r _ _ time <<< "$result"
-        if [ "$time" != "failed" ] && [ "$time" != "null" ]; then
+        if [[ "$time" =~ ^[0-9]*\.?[0-9]*$ ]] && [ "$time" != "0" ]; then
             total=$(echo "$total + $time" | bc 2>/dev/null || echo "$total")
             ((count++))
         fi
