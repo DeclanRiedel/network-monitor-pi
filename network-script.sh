@@ -96,46 +96,67 @@ EOF
 measure_connection_quality() {
     echo "Measuring connection quality..."
     local ping_stats
-    ping_stats=$(ping -I "$INTERFACE" -c 20 8.8.8.8 | grep -E 'rtt|packet loss')
-    
-    local packet_loss
-    packet_loss=$(echo "$ping_stats" | grep -oP '\d+(?=% packet loss)')
-    
-    local jitter
-    jitter=$(echo "$ping_stats" | awk -F '/' '{print $7}')
-    
-    local tcp_conn
-    tcp_conn=$(netstat -tn | grep ESTABLISHED | wc -l)
-    
-    local quality
-    if [ "${packet_loss:-100}" -lt 1 ] && [ "${jitter:-1000}" -lt 10 ]; then
+    local packet_loss=100
+    local jitter=0
+    local tcp_conn=0
+    local quality="Poor"
+
+    # Try to get ping statistics with error handling
+    if ! ping_stats=$(ping -I "$INTERFACE" -c 20 8.8.8.8 2>/dev/null | grep -E 'rtt|packet loss'); then
+        echo "Warning: Ping test failed, using default values"
+    else
+        # Extract packet loss with fallback
+        packet_loss=$(echo "$ping_stats" | grep -oP '\d+(?=% packet loss)' || echo "100")
+        
+        # Extract jitter with fallback
+        jitter=$(echo "$ping_stats" | awk -F '/' '{print $7}' || echo "0")
+    fi
+
+    # Get TCP connections with error handling
+    if ! tcp_conn=$(netstat -tn | grep ESTABLISHED | wc -l); then
+        tcp_conn=0
+        echo "Warning: Could not get TCP connection count"
+    fi
+
+    # Determine quality with more defensive checks
+    packet_loss=${packet_loss:-100}  # Default to 100 if empty
+    jitter=${jitter:-1000}          # Default to 1000 if empty
+
+    if [ "${packet_loss}" -lt 1 ] && [ "${jitter%.*}" -lt 10 ]; then
         quality="Excellent"
-    elif [ "${packet_loss:-100}" -lt 5 ] && [ "${jitter:-1000}" -lt 30 ]; then
+    elif [ "${packet_loss}" -lt 5 ] && [ "${jitter%.*}" -lt 30 ]; then
         quality="Good"
     else
         quality="Poor"
     fi
-    
+
+    # Create JSON output with error handling
     echo "{
         \"timestamp\": \"$(date '+%Y-%m-%d %H:%M:%S')\",
         \"packet_loss\": $packet_loss,
-        \"jitter\": $jitter,
+        \"jitter\": ${jitter:-0},
         \"tcp_connections\": $tcp_conn,
         \"quality\": \"$quality\"
     }" > "$DATA_DIR/connection_quality.json"
-    
-    # Save to database
-    sqlite3 "$DB_FILE" <<EOF
+
+    # Save to database with error handling
+    if ! sqlite3 "$DB_FILE" <<EOF
 INSERT INTO network_stats (
     timestamp, packet_loss, jitter, tcp_connections, connection_quality
 ) VALUES (
     '$(date '+%Y-%m-%d %H:%M:%S')',
     $packet_loss,
-    $jitter,
+    ${jitter:-0},
     $tcp_conn,
     '$quality'
 );
 EOF
+    then
+        echo "Warning: Failed to save to database"
+    fi
+
+    echo "Connection quality measurement completed"
+    return 0
 }
 
 # Enhanced throttling test
