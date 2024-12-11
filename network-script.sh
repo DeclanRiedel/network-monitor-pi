@@ -59,27 +59,20 @@ create_dirs_and_files() {
 # Initialize SQLite database
 init_database() {
     echo "Initializing database..."
-    # Ensure directory exists
-    mkdir -p "$(dirname "$DB_FILE")"
     
-    # Create database with proper permissions
-    if [[ ! -f "$DB_FILE" ]]; then
-        touch "$DB_FILE"
-        chmod 666 "$DB_FILE"
-        
-        sqlite3 "$DB_FILE" <<'EOF'
+    sqlite3 "$DB_FILE" <<'EOF'
 CREATE TABLE IF NOT EXISTS network_stats (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp TEXT NOT NULL,
     download_speed REAL DEFAULT 0,
     upload_speed REAL DEFAULT 0,
     latency REAL DEFAULT 0,
-    jitter REAL DEFAULT 0,
     packet_loss REAL DEFAULT 0,
+    jitter REAL DEFAULT 0,
     dns_time REAL DEFAULT 0,
-    bandwidth_usage REAL DEFAULT 0,
     tcp_connections INTEGER DEFAULT 0,
-    connection_quality TEXT
+    connection_quality TEXT,
+    bandwidth_usage REAL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS throttling_tests (
@@ -95,17 +88,112 @@ CREATE TABLE IF NOT EXISTS throttling_tests (
     test_duration REAL DEFAULT 0
 );
 
-CREATE TABLE IF NOT EXISTS hourly_stats (
+CREATE TABLE IF NOT EXISTS routing_info (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    hour TEXT NOT NULL,
-    avg_download REAL DEFAULT 0,
-    avg_upload REAL DEFAULT 0,
-    avg_latency REAL DEFAULT 0,
-    peak_bandwidth REAL DEFAULT 0,
-    connection_drops INTEGER DEFAULT 0
+    timestamp TEXT NOT NULL,
+    gateway TEXT,
+    hops_to_internet INTEGER,
+    gateway_latency REAL
+);
+
+CREATE TABLE IF NOT EXISTS wifi_stats (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    signal_strength TEXT,
+    noise_level TEXT,
+    link_quality TEXT
+);
+
+CREATE TABLE IF NOT EXISTS interface_errors (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    rx_errors INTEGER,
+    tx_errors INTEGER,
+    rx_dropped INTEGER,
+    tx_dropped INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS tcp_states (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    established INTEGER,
+    time_wait INTEGER,
+    close_wait INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS mtu_info (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    mtu INTEGER,
+    fragmentation_allowed INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS ipv6_status (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    has_ipv6 INTEGER,
+    ipv6_reachable INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS dns_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    record_type TEXT,
+    lookup_time REAL
+);
+
+CREATE TABLE IF NOT EXISTS tcp_stack_stats (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    tcp_timeouts INTEGER,
+    retransmits INTEGER,
+    fast_retransmits INTEGER,
+    forward_retransmits INTEGER,
+    lost_retransmits INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS buffer_stats (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    rx_buffer INTEGER,
+    tx_buffer INTEGER,
+    backlog INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS congestion_stats (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    congestion_algorithm TEXT,
+    qdisc TEXT,
+    queue_drops INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS socket_stats (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    used_sockets INTEGER,
+    orphaned INTEGER,
+    time_wait INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS device_stats (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    speed INTEGER,
+    duplex TEXT,
+    carrier INTEGER,
+    driver TEXT
+);
+
+CREATE TABLE IF NOT EXISTS protocol_stats (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    ip_forwarding INTEGER,
+    ip_fragments INTEGER,
+    udp_packets INTEGER,
+    icmp_messages INTEGER
 );
 EOF
-    fi
     echo "Database initialization completed"
 }
 
@@ -605,84 +693,411 @@ EOF
     fi
 }
 
+# Monitor route changes and latency to gateway
+monitor_routing() {
+    local gateway=$(ip route | grep default | awk '{print $3}')
+    local hops=$(traceroute -n -w 1 8.8.8.8 | wc -l)
+    local gateway_latency=$(ping -c 3 "$gateway" | grep 'avg' | awk -F'/' '{print $5}')
+    
+    echo "{
+        \"timestamp\": \"$(date '+%Y-%m-%d %H:%M:%S')\",
+        \"gateway\": \"$gateway\",
+        \"hops_to_internet\": $hops,
+        \"gateway_latency\": $gateway_latency
+    }" > "$DATA_DIR/routing_info.json"
+    
+    sqlite3 "$DB_FILE" <<EOF
+INSERT INTO routing_info (timestamp, gateway, hops_to_internet, gateway_latency)
+VALUES ('$(date '+%Y-%m-%d %H:%M:%S')', '$gateway', $hops, $gateway_latency);
+EOF
+}
+
+# Monitor WiFi signal strength (if applicable)
+monitor_wifi() {
+    if [[ "$INTERFACE" == wlan* ]]; then
+        local signal=$(iwconfig "$INTERFACE" | grep "Signal level" | awk -F"=" '{print $3}')
+        local noise=$(iwconfig "$INTERFACE" | grep "Noise level" | awk -F"=" '{print $2}')
+        local quality=$(iwconfig "$INTERFACE" | grep "Link Quality" | awk -F"=" '{print $2}')
+        
+        echo "{
+            \"timestamp\": \"$(date '+%Y-%m-%d %H:%M:%S')\",
+            \"signal_strength\": \"$signal\",
+            \"noise_level\": \"$noise\",
+            \"link_quality\": \"$quality\"
+        }" > "$DATA_DIR/wifi_stats.json"
+        
+        sqlite3 "$DB_FILE" <<EOF
+INSERT INTO wifi_stats (timestamp, signal_strength, noise_level, link_quality)
+VALUES ('$(date '+%Y-%m-%d %H:%M:%S')', '$signal', '$noise', '$quality');
+EOF
+    fi
+}
+
+# Monitor network interface errors
+monitor_interface_errors() {
+    local rx_errors=$(cat "/sys/class/net/$INTERFACE/statistics/rx_errors")
+    local tx_errors=$(cat "/sys/class/net/$INTERFACE/statistics/tx_errors")
+    local rx_dropped=$(cat "/sys/class/net/$INTERFACE/statistics/rx_dropped")
+    local tx_dropped=$(cat "/sys/class/net/$INTERFACE/statistics/tx_dropped")
+    
+    echo "{
+        \"timestamp\": \"$(date '+%Y-%m-%d %H:%M:%S')\",
+        \"rx_errors\": $rx_errors,
+        \"tx_errors\": $tx_errors,
+        \"rx_dropped\": $rx_dropped,
+        \"tx_dropped\": $tx_dropped
+    }" > "$DATA_DIR/interface_errors.json"
+    
+    sqlite3 "$DB_FILE" <<EOF
+INSERT INTO interface_errors (timestamp, rx_errors, tx_errors, rx_dropped, tx_dropped)
+VALUES ('$(date '+%Y-%m-%d %H:%M:%S')', $rx_errors, $tx_errors, $rx_dropped, $tx_dropped);
+EOF
+}
+
+# Monitor TCP connection states
+monitor_tcp_states() {
+    local established=$(ss -tn state established | wc -l)
+    local time_wait=$(ss -tn state time-wait | wc -l)
+    local close_wait=$(ss -tn state close-wait | wc -l)
+    
+    echo "{
+        \"timestamp\": \"$(date '+%Y-%m-%d %H:%M:%S')\",
+        \"established\": $established,
+        \"time_wait\": $time_wait,
+        \"close_wait\": $close_wait
+    }" > "$DATA_DIR/tcp_states.json"
+    
+    sqlite3 "$DB_FILE" <<EOF
+INSERT INTO tcp_states (timestamp, established, time_wait, close_wait)
+VALUES ('$(date '+%Y-%m-%d %H:%M:%S')', $established, $time_wait, $close_wait);
+EOF
+}
+
+# Monitor MTU changes and fragmentation
+monitor_mtu() {
+    local current_mtu=$(ip link show "$INTERFACE" | grep mtu | awk '{print $5}')
+    local fragmentation=$(cat /proc/sys/net/ipv4/ip_no_pmtu_disc)
+    
+    echo "{
+        \"timestamp\": \"$(date '+%Y-%m-%d %H:%M:%S')\",
+        \"mtu\": $current_mtu,
+        \"fragmentation_allowed\": $fragmentation
+    }" > "$DATA_DIR/mtu_info.json"
+    
+    sqlite3 "$DB_FILE" <<EOF
+INSERT INTO mtu_info (timestamp, mtu, fragmentation_allowed)
+VALUES ('$(date '+%Y-%m-%d %H:%M:%S')', $current_mtu, $fragmentation);
+EOF
+}
+
+# Monitor IPv6 connectivity
+test_ipv6() {
+    local has_ipv6=$(ip -6 addr show dev "$INTERFACE" 2>/dev/null)
+    local ipv6_reachable=0
+    
+    if ping6 -c 1 2001:4860:4860::8888 >/dev/null 2>&1; then
+        ipv6_reachable=1
+    fi
+    
+    echo "{
+        \"timestamp\": \"$(date '+%Y-%m-%d %H:%M:%S')\",
+        \"has_ipv6\": ${has_ipv6:+1},
+        \"ipv6_reachable\": $ipv6_reachable
+    }" > "$DATA_DIR/ipv6_status.json"
+    
+    sqlite3 "$DB_FILE" <<EOF
+INSERT INTO ipv6_status (timestamp, has_ipv6, ipv6_reachable)
+VALUES ('$(date '+%Y-%m-%d %H:%M:%S')', ${has_ipv6:+1}, $ipv6_reachable);
+EOF
+}
+
+# Monitor DNS resolution times for different record types
+test_dns_records() {
+    local domain="google.com"
+    local start_time end_time
+    
+    # Test different record types
+    for record in A AAAA MX TXT; do
+        start_time=$(date +%s.%N)
+        dig "$domain" "$record" +short >/dev/null
+        end_time=$(date +%s.%N)
+        local lookup_time=$(echo "$end_time - $start_time" | bc)
+        
+        echo "{
+            \"timestamp\": \"$(date '+%Y-%m-%d %H:%M:%S')\",
+            \"record_type\": \"$record\",
+            \"lookup_time\": $lookup_time
+        }" >> "$DATA_DIR/dns_records.json"
+        
+        sqlite3 "$DB_FILE" <<EOF
+INSERT INTO dns_records (timestamp, record_type, lookup_time)
+VALUES ('$(date '+%Y-%m-%d %H:%M:%S')', '$record', $lookup_time);
+EOF
+    done
+}
+
+# Additional monitoring functions
+
+# Monitor TCP/IP stack parameters
+monitor_tcp_stack() {
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local tcp_stats=""
+    
+    # Attempt to get TCP stats with error handling
+    if ! tcp_stats=$(cat /proc/net/netstat 2>/dev/null | awk '
+        /TcpExt/ { 
+            getline; 
+            printf "\"tcp_timeouts\": %s,\n\"retransmits\": %s,\n\"fast_retransmits\": %s,\n\"forward_retransmits\": %s,\n\"lost_retransmits\": %s", 
+            $13, $45, $46, $47, $48 
+        }'); then
+        handle_function_error "monitor_tcp_stack" "Failed to read TCP stats"
+        tcp_stats="\"tcp_timeouts\": 0,\"retransmits\": 0,\"fast_retransmits\": 0,\"forward_retransmits\": 0,\"lost_retransmits\": 0"
+    fi
+    
+    # Write to JSON with error handling
+    if ! echo "{
+        \"timestamp\": \"$timestamp\",
+        $tcp_stats
+    }" > "$DATA_DIR/tcp_stack.json"; then
+        handle_function_error "monitor_tcp_stack" "Failed to write JSON file"
+    fi
+    
+    # Write to database with error handling
+    if ! sqlite3 "$DB_FILE" <<EOF
+INSERT INTO tcp_stack_stats (
+    timestamp, tcp_timeouts, retransmits, fast_retransmits, 
+    forward_retransmits, lost_retransmits
+) VALUES (
+    '$timestamp',
+    $(echo "$tcp_stats" | grep -oP 'tcp_timeouts": \K[0-9]+' || echo "0"),
+    $(echo "$tcp_stats" | grep -oP 'retransmits": \K[0-9]+' || echo "0"),
+    $(echo "$tcp_stats" | grep -oP 'fast_retransmits": \K[0-9]+' || echo "0"),
+    $(echo "$tcp_stats" | grep -oP 'forward_retransmits": \K[0-9]+' || echo "0"),
+    $(echo "$tcp_stats" | grep -oP 'lost_retransmits": \K[0-9]+' || echo "0")
+);
+EOF
+    then
+        handle_function_error "monitor_tcp_stack" "Failed to write to database"
+    fi
+    
+    return 0  # Ensure function continues even if parts fail
+}
+
+# Monitor network buffer statistics
+monitor_network_buffers() {
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local rx_buffer=$(sysctl -n net.core.rmem_default)
+    local tx_buffer=$(sysctl -n net.core.wmem_default)
+    local backlog=$(sysctl -n net.core.netdev_max_backlog)
+    
+    echo "{
+        \"timestamp\": \"$timestamp\",
+        \"rx_buffer\": $rx_buffer,
+        \"tx_buffer\": $tx_buffer,
+        \"backlog\": $backlog
+    }" > "$DATA_DIR/network_buffers.json"
+    
+    sqlite3 "$DB_FILE" <<EOF
+INSERT INTO buffer_stats (timestamp, rx_buffer, tx_buffer, backlog)
+VALUES ('$timestamp', $rx_buffer, $tx_buffer, $backlog);
+EOF
+}
+
+# Monitor network congestion
+monitor_congestion() {
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local algorithm=$(sysctl -n net.ipv4.tcp_congestion_control)
+    local qdisc=$(tc qdisc show dev "$INTERFACE" | head -n1)
+    local queue_drops=$(tc -s qdisc show dev "$INTERFACE" | grep -oP 'dropped \K[0-9]+')
+    
+    echo "{
+        \"timestamp\": \"$timestamp\",
+        \"congestion_algorithm\": \"$algorithm\",
+        \"qdisc\": \"$qdisc\",
+        \"queue_drops\": $queue_drops
+    }" > "$DATA_DIR/congestion.json"
+    
+    sqlite3 "$DB_FILE" <<EOF
+INSERT INTO congestion_stats (
+    timestamp, congestion_algorithm, qdisc, queue_drops
+) VALUES (
+    '$timestamp', '$algorithm', '$qdisc', $queue_drops
+);
+EOF
+}
+
+# Monitor socket statistics
+monitor_socket_stats() {
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local used_sockets=$(ss -s | grep 'TCP:' | awk '{print $2}')
+    local orphaned=$(cat /proc/net/sockstat | grep TCP: | awk '{print $4}')
+    local time_wait=$(cat /proc/net/sockstat | grep TCP: | awk '{print $6}')
+    
+    echo "{
+        \"timestamp\": \"$timestamp\",
+        \"used_sockets\": $used_sockets,
+        \"orphaned\": $orphaned,
+        \"time_wait\": $time_wait
+    }" > "$DATA_DIR/socket_stats.json"
+    
+    sqlite3 "$DB_FILE" <<EOF
+INSERT INTO socket_stats (timestamp, used_sockets, orphaned, time_wait)
+VALUES ('$timestamp', $used_sockets, $orphaned, $time_wait);
+EOF
+}
+
+# Monitor network device details
+monitor_device_details() {
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local speed=$(cat "/sys/class/net/$INTERFACE/speed" 2>/dev/null || echo "0")
+    local duplex=$(cat "/sys/class/net/$INTERFACE/duplex" 2>/dev/null || echo "unknown")
+    local carrier=$(cat "/sys/class/net/$INTERFACE/carrier" 2>/dev/null || echo "0")
+    local driver=$(ethtool -i "$INTERFACE" 2>/dev/null | grep driver | awk '{print $2}')
+    
+    echo "{
+        \"timestamp\": \"$timestamp\",
+        \"speed\": $speed,
+        \"duplex\": \"$duplex\",
+        \"carrier\": $carrier,
+        \"driver\": \"$driver\"
+    }" > "$DATA_DIR/device_details.json"
+    
+    sqlite3 "$DB_FILE" <<EOF
+INSERT INTO device_stats (timestamp, speed, duplex, carrier, driver)
+VALUES ('$timestamp', $speed, '$duplex', $carrier, '$driver');
+EOF
+}
+
+# Monitor network protocol statistics
+monitor_protocol_stats() {
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local ip_stats=$(cat /proc/net/snmp | awk '/Ip:/ {getline; print}')
+    local udp_stats=$(cat /proc/net/snmp | awk '/Udp:/ {getline; print}')
+    local icmp_stats=$(cat /proc/net/snmp | awk '/Icmp:/ {getline; print}')
+    
+    echo "{
+        \"timestamp\": \"$timestamp\",
+        \"ip_forwarding\": $(sysctl -n net.ipv4.ip_forward),
+        \"ip_fragments\": $(echo "$ip_stats" | awk '{print $7}'),
+        \"udp_packets\": $(echo "$udp_stats" | awk '{print $2}'),
+        \"icmp_messages\": $(echo "$icmp_stats" | awk '{print $2}')
+    }" > "$DATA_DIR/protocol_stats.json"
+    
+    sqlite3 "$DB_FILE" <<EOF
+INSERT INTO protocol_stats (
+    timestamp, ip_forwarding, ip_fragments, udp_packets, icmp_messages
+) VALUES (
+    '$timestamp',
+    $(sysctl -n net.ipv4.ip_forward),
+    $(echo "$ip_stats" | awk '{print $7}'),
+    $(echo "$udp_stats" | awk '{print $2}'),
+    $(echo "$icmp_stats" | awk '{print $2}')
+);
+EOF
+}
+
+# Error handling wrapper function
+handle_function_error() {
+    local function_name="$1"
+    local error_message="$2"
+    echo "Warning: $function_name failed - $error_message" >> "$DATA_DIR/errors.log"
+    echo "Warning: $function_name failed - $error_message"
+}
+
+# Monitor DNS with error handling
+test_dns_performance() {
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local lookup_time=0
+    
+    # Attempt DNS lookup with timeout and error handling
+    if ! lookup_time=$(timeout 5 dig google.com +tries=1 2>/dev/null | grep "Query time:" | awk '{print $4}'); then
+        handle_function_error "test_dns_performance" "DNS lookup failed"
+        lookup_time=0
+    fi
+    
+    # Write to JSON with error handling
+    if ! echo "{
+        \"timestamp\": \"$timestamp\",
+        \"lookup_time\": ${lookup_time:-0}
+    }" > "$DATA_DIR/dns_performance.json"; then
+        handle_function_error "test_dns_performance" "Failed to write JSON file"
+    fi
+    
+    # Write to database with error handling
+    if ! sqlite3 "$DB_FILE" <<EOF
+INSERT INTO network_stats (timestamp, dns_time)
+VALUES ('$timestamp', ${lookup_time:-0});
+EOF
+    then
+        handle_function_error "test_dns_performance" "Failed to write to database"
+    fi
+    
+    return 0
+}
+
+# Monitor bandwidth with error handling
+monitor_bandwidth() {
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local download=0
+    local upload=0
+    
+    # Attempt speedtest with timeout
+    if ! speed_result=$(timeout 30 speedtest-cli --json 2>/dev/null); then
+        handle_function_error "monitor_bandwidth" "Speed test failed"
+    else
+        download=$(echo "$speed_result" | jq -r '.download' 2>/dev/null || echo "0")
+        upload=$(echo "$speed_result" | jq -r '.upload' 2>/dev/null || echo "0")
+    fi
+    
+    # Write to JSON with error handling
+    if ! echo "{
+        \"timestamp\": \"$timestamp\",
+        \"download\": ${download:-0},
+        \"upload\": ${upload:-0}
+    }" > "$DATA_DIR/bandwidth.json"; then
+        handle_function_error "monitor_bandwidth" "Failed to write JSON file"
+    fi
+    
+    # Write to database with error handling
+    if ! sqlite3 "$DB_FILE" <<EOF
+INSERT INTO network_stats (timestamp, download_speed, upload_speed)
+VALUES ('$timestamp', ${download:-0}, ${upload:-0});
+EOF
+    then
+        handle_function_error "monitor_bandwidth" "Failed to write to database"
+    fi
+    
+    return 0
+}
+
 # Main routine
 main() {
     echo "Starting network monitoring script..."
     
-    # Create lock file directory if it doesn't exist
-    sudo mkdir -p "$(dirname "${LOCK_FILE}")" 2>/dev/null || true
+    # Create error log if it doesn't exist
+    touch "$DATA_DIR/errors.log"
     
-    # Prevent multiple instances using redirection instead of mkdir
-    exec 9>"${LOCK_FILE}"
-    if ! flock -n 9; then
-        echo "Script is already running"
-        exit 1
-    fi
-    
-    # Setup cleanup traps
-    trap 'rm -f "${LOCK_FILE}"; exec 9>&-' EXIT INT TERM
-    
-    # Initial setup
-    check_dependencies
-    create_dirs_and_files
-    init_database
-    
-    echo "Initial setup completed. Starting monitoring loop..."
-    
-    # Main monitoring loop
     while true; do
         echo "======================================"
         echo "Starting network tests at $(date)"
-        echo "Interface: $INTERFACE"
-        echo "======================================"
         
-        # Run disk space check
-        check_disk_space || echo "Warning: Disk space check failed"
-        
-        # Run connection quality test
-        echo "Running connection quality test..."
-        measure_connection_quality || echo "Warning: Connection quality test failed"
-        
-        # Run DNS performance test
-        echo "Running DNS performance test..."
-        test_dns_performance || echo "Warning: DNS performance test failed"
-        
-        # Run throttling test
-        echo "Running throttling test..."
-        test_throttling || echo "Warning: Throttling test failed"
-        
-        # Monitor bandwidth
-        echo "Monitoring bandwidth..."
-        monitor_bandwidth || echo "Warning: Bandwidth monitoring failed"
-        
-        # Get latest measurements for spike and drop detection
-        echo "Checking for speed anomalies..."
-        local latest
-        latest=$(sqlite3 "$DB_FILE" "SELECT download_speed, upload_speed, latency 
-            FROM network_stats ORDER BY timestamp DESC LIMIT 1;")
-        
-        if [ -n "$latest" ]; then
-            IFS='|' read -r current_download current_upload current_latency <<< "$latest"
-            
-            # Run spike and drop detection
-            detect_spikes "$current_download" "$current_upload" "$current_latency"
-            track_speed_drops "$current_download" "$current_upload"
-        else
-            echo "Warning: Could not get latest measurements"
-        fi
+        # Run each monitoring function with error handling
+        for function in monitor_tcp_stack test_dns_performance monitor_bandwidth monitor_routing monitor_wifi monitor_interface_errors monitor_tcp_states monitor_mtu test_ipv6 test_dns_records monitor_network_buffers monitor_congestion monitor_socket_stats monitor_device_details monitor_protocol_stats; do
+            if ! $function; then
+                handle_function_error "$function" "Function failed but continuing script"
+            fi
+            sleep 1  # Small delay between tests
+        done
         
         echo "Tests completed at $(date)"
-        echo "Waiting 30 minutes before next run..."
+        echo "Waiting for next run..."
         echo "======================================"
         
-        # Sleep for 30 minutes
         sleep 1800 || {
-            echo "Sleep interrupted"
+            handle_function_error "main" "Sleep interrupted"
             break
         }
     done
-    
-    echo "Network monitoring completed"
 }
 
 # Start the script with error handling
