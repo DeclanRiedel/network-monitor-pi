@@ -95,6 +95,17 @@ log_debug() {
     echo "[$timestamp] DEBUG: $debug_msg" >> "$DEBUG_LOG"
 }
 
+# Error handling function for commands
+handle_error() {
+    local exit_code=$?
+    local command="$1"
+    if [ $exit_code -ne 0 ]; then
+        log_error "Command '$command' failed with exit code $exit_code"
+        return $exit_code
+    fi
+    return 0
+}
+
 # Bandwidth Metrics Collection
 collect_bandwidth_metrics() {
     try {
@@ -430,120 +441,128 @@ EOF
 # Enhanced interface metrics collection
 collect_interface_metrics() {
     for interface in "${INTERFACES[@]}"; do
-        try {
-            # Basic interface statistics
-            stats=$(ip -s link show $interface 2>/dev/null)
-            if [ $? -ne 0 ]; then
-                throw "Failed to get stats for $interface"
-            }
+        # Basic interface statistics
+        stats=$(ip -s link show $interface 2>/dev/null)
+        if ! handle_error "ip -s link show $interface"; then
+            log_error "Failed to get stats for $interface"
+            continue
+        fi
 
-            # Parse basic statistics
-            rx_bytes=$(echo "$stats" | awk '/RX:/{getline; print $1}')
-            tx_bytes=$(echo "$stats" | awk '/TX:/{getline; print $1}')
-            rx_packets=$(echo "$stats" | awk '/RX:/{getline; print $2}')
-            tx_packets=$(echo "$stats" | awk '/TX:/{getline; print $2}')
-            rx_errors=$(echo "$stats" | awk '/RX:/{getline; print $3}')
-            tx_errors=$(echo "$stats" | awk '/TX:/{getline; print $3}')
-            rx_dropped=$(echo "$stats" | awk '/RX:/{getline; print $4}')
-            tx_dropped=$(echo "$stats" | awk '/TX:/{getline; print $4}')
+        # Parse basic statistics
+        rx_bytes=$(echo "$stats" | awk '/RX:/{getline; print $1}')
+        tx_bytes=$(echo "$stats" | awk '/TX:/{getline; print $1}')
+        rx_packets=$(echo "$stats" | awk '/RX:/{getline; print $2}')
+        tx_packets=$(echo "$stats" | awk '/TX:/{getline; print $2}')
+        rx_errors=$(echo "$stats" | awk '/RX:/{getline; print $3}')
+        tx_errors=$(echo "$stats" | awk '/TX:/{getline; print $3}')
+        rx_dropped=$(echo "$stats" | awk '/RX:/{getline; print $4}')
+        tx_dropped=$(echo "$stats" | awk '/TX:/{getline; print $4}')
 
-            # Get MTU settings
-            mtu=$(ip link show $interface | grep -oP 'mtu \K\d+')
+        # Get MTU settings
+        mtu=$(ip link show $interface | grep -oP 'mtu \K\d+' || echo "0")
 
-            # Get queue length
-            queue_length=$(ip link show $interface | grep -oP 'qlen \K\d+')
+        # Get queue length
+        queue_length=$(ip link show $interface | grep -oP 'qlen \K\d+' || echo "0")
 
-            # Get power management state
-            power_mgmt=$(ethtool --show-features $interface 2>/dev/null | grep "Power Management:" | awk '{print $3}')
+        # Get power management state
+        power_mgmt=$(ethtool --show-features $interface 2>/dev/null | grep "Power Management:" | awk '{print $3}' || echo "unknown")
 
-            # Get hardware offload capabilities
-            rx_checksumming=$(ethtool --show-features $interface 2>/dev/null | grep "rx-checksumming:" | awk '{print $3}')
-            tx_checksumming=$(ethtool --show-features $interface 2>/dev/null | grep "tx-checksumming:" | awk '{print $3}')
-            scatter_gather=$(ethtool --show-features $interface 2>/dev/null | grep "scatter-gather:" | awk '{print $3}')
-            tcp_segmentation=$(ethtool --show-features $interface 2>/dev/null | grep "tcp-segmentation-offload:" | awk '{print $3}')
+        # Get hardware offload capabilities
+        rx_checksumming=$(ethtool --show-features $interface 2>/dev/null | grep "rx-checksumming:" | awk '{print $3}' || echo "unknown")
+        tx_checksumming=$(ethtool --show-features $interface 2>/dev/null | grep "tx-checksumming:" | awk '{print $3}' || echo "unknown")
+        scatter_gather=$(ethtool --show-features $interface 2>/dev/null | grep "scatter-gather:" | awk '{print $3}' || echo "unknown")
+        tcp_segmentation=$(ethtool --show-features $interface 2>/dev/null | grep "tcp-segmentation-offload:" | awk '{print $3}' || echo "unknown")
 
-            # Check link aggregation status
-            bond_status="none"
-            if [ -d "/sys/class/net/$interface/bonding" ]; then
-                bond_status=$(cat /sys/class/net/$interface/bonding/mode 2>/dev/null || echo "active")
-            fi
+        # Check link aggregation status
+        bond_status="none"
+        if [ -d "/sys/class/net/$interface/bonding" ]; then
+            bond_status=$(cat /sys/class/net/$interface/bonding/mode 2>/dev/null || echo "active")
+        fi
 
-            # Interface specific advanced metrics
-            if [[ $interface == eth* ]]; then
-                # Ethernet specific
-                eth_info=$(ethtool $interface 2>/dev/null)
-                speed=$(echo "$eth_info" | grep 'Speed:' | awk '{print $2}' | tr -d 'Mb/s')
-                duplex=$(echo "$eth_info" | grep 'Duplex:' | awk '{print $2}')
-                auto_negotiation=$(echo "$eth_info" | grep 'Auto-negotiation:' | awk '{print $2}')
-                port_type=$(echo "$eth_info" | grep 'Port:' | awk '{print $2}')
-                
-                # Get EEE (Energy Efficient Ethernet) status
-                eee_status=$(ethtool --show-eee $interface 2>/dev/null | grep "EEE status:" | awk '{print $3}')
-                
-            elif [[ $interface == wlan* ]]; then
-                # Wireless specific
-                wifi_info=$(iwconfig $interface 2>/dev/null)
-                speed="$(echo "$wifi_info" | grep 'Bit Rate' | awk '{print $2}' | cut -d= -f2)"
-                duplex="full" # Wireless is typically full duplex
-                auto_negotiation="on"
-                port_type="wireless"
-                eee_status="n/a"
-            fi
+        # Interface specific advanced metrics
+        if [[ $interface == eth* ]]; then
+            # Ethernet specific
+            eth_info=$(ethtool $interface 2>/dev/null)
+            speed=$(echo "$eth_info" | grep 'Speed:' | awk '{print $2}' | tr -d 'Mb/s' || echo "0")
+            duplex=$(echo "$eth_info" | grep 'Duplex:' | awk '{print $2}' || echo "unknown")
+            auto_negotiation=$(echo "$eth_info" | grep 'Auto-negotiation:' | awk '{print $2}' || echo "unknown")
+            port_type=$(echo "$eth_info" | grep 'Port:' | awk '{print $2}' || echo "unknown")
+            
+            # Get EEE (Energy Efficient Ethernet) status
+            eee_status=$(ethtool --show-eee $interface 2>/dev/null | grep "EEE status:" | awk '{print $3}' || echo "unknown")
+            
+        elif [[ $interface == wlan* ]]; then
+            # Wireless specific
+            wifi_info=$(iwconfig $interface 2>/dev/null)
+            speed="$(echo "$wifi_info" | grep 'Bit Rate' | awk '{print $2}' | cut -d= -f2 || echo "0")"
+            duplex="full"
+            auto_negotiation="on"
+            port_type="wireless"
+            eee_status="n/a"
+        fi
 
-            sqlite3 "$DATA_DIR/network_metrics.db" <<EOF
-            INSERT INTO interface_metrics (
-                timestamp,
-                interface,
-                rx_bytes,
-                tx_bytes,
-                rx_packets,
-                tx_packets,
-                rx_errors,
-                tx_errors,
-                rx_dropped,
-                tx_dropped,
-                mtu,
-                queue_length,
-                power_management,
-                rx_checksumming,
-                tx_checksumming,
-                scatter_gather,
-                tcp_segmentation,
-                bond_status,
-                speed,
-                duplex,
-                auto_negotiation,
-                port_type,
-                eee_status
-            ) VALUES (
-                CURRENT_TIMESTAMP,
-                '$interface',
-                $rx_bytes,
-                $tx_bytes,
-                $rx_packets,
-                $tx_packets,
-                $rx_errors,
-                $tx_errors,
-                $rx_dropped,
-                $tx_dropped,
-                $mtu,
-                $queue_length,
-                '$power_mgmt',
-                '$rx_checksumming',
-                '$tx_checksumming',
-                '$scatter_gather',
-                '$tcp_segmentation',
-                '$bond_status',
-                '${speed:-0}',
-                '$duplex',
-                '$auto_negotiation',
-                '$port_type',
-                '$eee_status'
-            );
+        # Use default values if variables are empty
+        speed=${speed:-0}
+        duplex=${duplex:-unknown}
+        auto_negotiation=${auto_negotiation:-unknown}
+        port_type=${port_type:-unknown}
+        eee_status=${eee_status:-unknown}
+
+        # Insert into database with error handling
+        sqlite3 "$DATA_DIR/network_metrics.db" <<EOF
+        INSERT INTO interface_metrics (
+            timestamp,
+            interface,
+            rx_bytes,
+            tx_bytes,
+            rx_packets,
+            tx_packets,
+            rx_errors,
+            tx_errors,
+            rx_dropped,
+            tx_dropped,
+            mtu,
+            queue_length,
+            power_management,
+            rx_checksumming,
+            tx_checksumming,
+            scatter_gather,
+            tcp_segmentation,
+            bond_status,
+            speed,
+            duplex,
+            auto_negotiation,
+            port_type,
+            eee_status
+        ) VALUES (
+            CURRENT_TIMESTAMP,
+            '$interface',
+            ${rx_bytes:-0},
+            ${tx_bytes:-0},
+            ${rx_packets:-0},
+            ${tx_packets:-0},
+            ${rx_errors:-0},
+            ${tx_errors:-0},
+            ${rx_dropped:-0},
+            ${tx_dropped:-0},
+            ${mtu:-0},
+            ${queue_length:-0},
+            '${power_mgmt:-unknown}',
+            '${rx_checksumming:-unknown}',
+            '${tx_checksumming:-unknown}',
+            '${scatter_gather:-unknown}',
+            '${tcp_segmentation:-unknown}',
+            '${bond_status:-none}',
+            '${speed}',
+            '${duplex}',
+            '${auto_negotiation}',
+            '${port_type}',
+            '${eee_status}'
+        );
 EOF
-        } catch {
-            log_error "Failed to collect enhanced metrics for $interface: $ex"
-        }
+        if [ $? -ne 0 ]; then
+            log_error "Failed to insert metrics for $interface into database"
+        fi
     done
 }
 
