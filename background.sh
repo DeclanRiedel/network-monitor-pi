@@ -43,6 +43,16 @@ CREATE TABLE IF NOT EXISTS bandwidth_metrics (
     consistency_score REAL
 );
 
+CREATE TABLE IF NOT EXISTS latency_metrics (
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    server TEXT,
+    ping_time REAL,
+    jitter REAL,
+    rtt_avg REAL,
+    rtt_min REAL,
+    rtt_max REAL
+);
+
 CREATE TABLE IF NOT EXISTS network_quality (
     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
     interface TEXT,
@@ -51,6 +61,51 @@ CREATE TABLE IF NOT EXISTS network_quality (
     freq_band TEXT,
     tx_rate REAL,
     rx_rate REAL
+);
+
+CREATE TABLE IF NOT EXISTS protocol_metrics (
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    domain TEXT,
+    dns_resolution_time REAL,
+    tcp_connect_time REAL,
+    tcp_retrans INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS http_metrics (
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    url TEXT,
+    response_time REAL
+);
+
+CREATE TABLE IF NOT EXISTS stability_metrics (
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    uptime_percentage REAL,
+    current_status INTEGER,
+    interruption_duration INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS load_metrics (
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    concurrent_connections INTEGER,
+    bandwidth_utilization REAL,
+    incoming_traffic REAL,
+    outgoing_traffic REAL
+);
+
+CREATE TABLE IF NOT EXISTS security_metrics (
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    suspicious_connections INTEGER,
+    potential_scans INTEGER,
+    rx_errors INTEGER,
+    tx_errors INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS advanced_metrics (
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    mtu_size INTEGER,
+    tcp_window_scaling INTEGER,
+    buffer_bloat REAL,
+    congestion_control TEXT
 );
 
 CREATE TABLE IF NOT EXISTS interface_metrics (
@@ -631,15 +686,21 @@ EOF
 
 # Main monitoring loop
 main() {
-    init_database
+    # Ensure database is initialized first
+    if ! init_database; then
+        log_error "Failed to initialize database"
+        exit 1
+    fi
+    
+    log_debug "Database initialized successfully"
     
     while true; do
         timestamp=$(date '+%Y-%m-%d %H:%M:%S')
         log_debug "Starting metrics collection cycle at $timestamp"
         
-        collect_interface_metrics    # Collect basic stats for all interfaces
-        collect_network_quality      # Collect quality metrics for all interfaces
-        collect_bandwidth_metrics    # Use primary interface for speed test
+        collect_interface_metrics
+        collect_network_quality
+        collect_bandwidth_metrics
         collect_latency_metrics
         collect_stability_metrics
         collect_protocol_metrics
@@ -649,7 +710,7 @@ main() {
         
         export_current_metrics_json
         
-        sleep 300  # 5-minute interval
+        sleep 300
     done
 }
 
