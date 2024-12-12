@@ -163,75 +163,84 @@ handle_error() {
 
 # Bandwidth Metrics Collection
 collect_bandwidth_metrics() {
-    result=$(speedtest-cli --interface $PRIMARY_INTERFACE --json 2>/dev/null)
-    if ! handle_error "speedtest-cli"; then
-        log_error "Speedtest failed on $PRIMARY_INTERFACE"
-        return 1
-    fi
-    
-    download=$(echo "$result" | jq '.download')
-    upload=$(echo "$result" | jq '.upload')
-    
-    # Calculate speed ratio
-    download_ratio=$(echo "scale=2; $download / ($ADVERTISED_DOWNLOAD * 1000000)" | bc)
-    upload_ratio=$(echo "scale=2; $upload / ($ADVERTISED_UPLOAD * 1000000)" | bc)
-    
-    # Store in database
-    sqlite3 "$DATA_DIR/network_metrics.db" <<EOF
-    INSERT INTO bandwidth_metrics (
-        interface,
-        download_speed,
-        upload_speed,
-        speed_ratio_to_advertised
-    ) VALUES (
-        '$PRIMARY_INTERFACE',
-        $download,
-        $upload,
-        $download_ratio
-    );
+    for interface in "${INTERFACES[@]}"; do
+        # Initialize variables with defaults
+        download_speed=0
+        upload_speed=0
+        speed_ratio=0
+        
+        # Only attempt speedtest if interface is up
+        if ip link show $interface | grep -q "UP"; then
+            result=$(speedtest-cli --interface $interface --json 2>/dev/null)
+            if [ $? -eq 0 ]; then
+                download_speed=$(echo "$result" | jq -r '.download // 0')
+                upload_speed=$(echo "$result" | jq -r '.upload // 0')
+                speed_ratio=$(echo "scale=2; $download_speed / ($ADVERTISED_DOWNLOAD * 1000000)" | bc)
+            else
+                log_error "Speedtest failed on $interface"
+            fi
+        fi
+
+        sqlite3 "$DATA_DIR/network_metrics.db" <<EOF
+INSERT INTO bandwidth_metrics (
+    timestamp,
+    interface,
+    download_speed,
+    upload_speed,
+    speed_ratio_to_advertised
+) VALUES (
+    CURRENT_TIMESTAMP,
+    '$interface',
+    $download_speed,
+    $upload_speed,
+    $speed_ratio
+);
 EOF
-    if [ $? -ne 0 ]; then
-        log_error "Failed to insert bandwidth metrics into database"
-        return 1
-    fi
+    done
 }
 
 # Latency Measurements
 collect_latency_metrics() {
     for server in "${TEST_SERVERS[@]}"; do
+        # Initialize variables with defaults
+        rtt_avg=0
+        rtt_min=0
+        rtt_max=0
+        jitter=0
+        
         ping_result=$(ping -c 10 -i 0.2 "$server" 2>/dev/null)
-        if ! handle_error "ping $server"; then
-            log_error "Ping to $server failed"
-            continue
+        if [ $? -eq 0 ]; then
+            # Extract values using awk with proper error checking
+            rtt_stats=$(echo "$ping_result" | grep 'rtt min/avg/max/mdev' | awk -F'=' '{print $2}' | awk '{print $1"/"$2"/"$3}')
+            if [ ! -z "$rtt_stats" ]; then
+                rtt_min=$(echo "$rtt_stats" | cut -d'/' -f1)
+                rtt_avg=$(echo "$rtt_stats" | cut -d'/' -f2)
+                rtt_max=$(echo "$rtt_stats" | cut -d'/' -f3)
+                jitter=$(echo "$ping_result" | grep 'rtt min/avg/max/mdev' | awk -F'/' '{print $5}' | awk '{print $1}')
+            fi
+        else
+            log_error "Ping failed for $server"
         fi
-        
-        rtt_avg=$(echo "$ping_result" | awk -F '/' 'END {print $5}')
-        rtt_min=$(echo "$ping_result" | awk -F '/' 'END {print $4}')
-        rtt_max=$(echo "$ping_result" | awk -F '/' 'END {print $6}')
-        
-        # Calculate jitter
-        jitter=$(echo "$ping_result" | awk -F '=' '/rtt/ {split($2,a,"/"); print a[3]}')
-        
+
         sqlite3 "$DATA_DIR/network_metrics.db" <<EOF
-        INSERT INTO latency_metrics (
-            server,
-            ping_time,
-            jitter,
-            rtt_avg,
-            rtt_min,
-            rtt_max
-        ) VALUES (
-            '$server',
-            $rtt_avg,
-            $jitter,
-            $rtt_avg,
-            $rtt_min,
-            $rtt_max
-        );
+INSERT INTO latency_metrics (
+    timestamp,
+    server,
+    ping_time,
+    jitter,
+    rtt_avg,
+    rtt_min,
+    rtt_max
+) VALUES (
+    CURRENT_TIMESTAMP,
+    '$server',
+    $rtt_avg,
+    ${jitter:-0},
+    $rtt_avg,
+    $rtt_min,
+    $rtt_max
+);
 EOF
-        if [ $? -ne 0 ]; then
-            log_error "Failed to insert latency metrics for $server into database"
-        fi
     done
 }
 
@@ -419,53 +428,44 @@ EOF
 
 # Network Load Characteristics
 collect_load_metrics() {
+    # Initialize variables with defaults
+    concurrent_connections=0
+    bandwidth_util=0
+    in_traffic=0
+    out_traffic=0
+    
     # Get current connections count
-    concurrent_connections=$(netstat -an | grep ESTABLISHED | wc -l)
-    if [ $? -ne 0 ]; then
-        log_error "Failed to get connection count"
-        concurrent_connections=0
-    fi
-        
-    # Get bandwidth utilization
+    concurrent_connections=$(netstat -an | grep ESTABLISHED | wc -l || echo "0")
+    
+    # Get bandwidth utilization if vnstat is available
     if command -v vnstat >/dev/null; then
-        bandwidth_util=$(vnstat -tr 2 | grep "rx" | awk '{print $2}')
-        if [ $? -ne 0 ]; then
-            log_error "Failed to get bandwidth utilization"
-            bandwidth_util=0
-        fi
+        bandwidth_util=$(vnstat -tr 2 | grep "rx" | awk '{print $2}' || echo "0")
     fi
-        
-    # Get interface statistics
+    
+    # Get interface statistics if ifstat is available
     if command -v ifstat >/dev/null; then
         interface_stats=$(ifstat -i "$PRIMARY_INTERFACE" 1 1)
         if [ $? -eq 0 ]; then
-            in_traffic=$(echo "$interface_stats" | tail -n 1 | awk '{print $1}')
-            out_traffic=$(echo "$interface_stats" | tail -n 1 | awk '{print $2}')
-        else
-            log_error "Failed to get interface statistics"
-            in_traffic=0
-            out_traffic=0
+            in_traffic=$(echo "$interface_stats" | tail -n 1 | awk '{print $1}' || echo "0")
+            out_traffic=$(echo "$interface_stats" | tail -n 1 | awk '{print $2}' || echo "0")
         fi
     fi
-        
+
     sqlite3 "$DATA_DIR/network_metrics.db" <<EOF
-    INSERT INTO load_metrics (
-        timestamp,
-        concurrent_connections,
-        bandwidth_utilization,
-        incoming_traffic,
-        outgoing_traffic
-    ) VALUES (
-        CURRENT_TIMESTAMP,
-        $concurrent_connections,
-        ${bandwidth_util:-0},
-        ${in_traffic:-0},
-        ${out_traffic:-0}
-    );
+INSERT INTO load_metrics (
+    timestamp,
+    concurrent_connections,
+    bandwidth_utilization,
+    incoming_traffic,
+    outgoing_traffic
+) VALUES (
+    CURRENT_TIMESTAMP,
+    $concurrent_connections,
+    $bandwidth_util,
+    $in_traffic,
+    $out_traffic
+);
 EOF
-    if [ $? -ne 0 ]; then
-        log_error "Failed to insert load metrics"
-    fi
 }
 
 # Advanced Technical Metrics
