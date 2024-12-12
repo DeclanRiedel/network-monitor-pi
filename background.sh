@@ -108,87 +108,87 @@ handle_error() {
 
 # Bandwidth Metrics Collection
 collect_bandwidth_metrics() {
-    try {
-        result=$(speedtest-cli --interface $PRIMARY_INTERFACE --json 2>/dev/null)
-        if [ $? -ne 0 ]; then
-            throw "Speedtest failed on $PRIMARY_INTERFACE"
-        }
-        
-        download=$(echo "$result" | jq '.download')
-        upload=$(echo "$result" | jq '.upload')
-        
-        # Calculate speed ratio
-        download_ratio=$(echo "scale=2; $download / ($ADVERTISED_DOWNLOAD * 1000000)" | bc)
-        upload_ratio=$(echo "scale=2; $upload / ($ADVERTISED_UPLOAD * 1000000)" | bc)
-        
-        # Store in database
-        sqlite3 "$DATA_DIR/network_metrics.db" <<EOF
-        INSERT INTO bandwidth_metrics (
-            interface,
-            download_speed,
-            upload_speed,
-            speed_ratio_to_advertised
-        ) VALUES (
-            '$PRIMARY_INTERFACE',
-            $download,
-            $upload,
-            $download_ratio
-        );
+    result=$(speedtest-cli --interface $PRIMARY_INTERFACE --json 2>/dev/null)
+    if ! handle_error "speedtest-cli"; then
+        log_error "Speedtest failed on $PRIMARY_INTERFACE"
+        return 1
+    fi
+    
+    download=$(echo "$result" | jq '.download')
+    upload=$(echo "$result" | jq '.upload')
+    
+    # Calculate speed ratio
+    download_ratio=$(echo "scale=2; $download / ($ADVERTISED_DOWNLOAD * 1000000)" | bc)
+    upload_ratio=$(echo "scale=2; $upload / ($ADVERTISED_UPLOAD * 1000000)" | bc)
+    
+    # Store in database
+    sqlite3 "$DATA_DIR/network_metrics.db" <<EOF
+    INSERT INTO bandwidth_metrics (
+        interface,
+        download_speed,
+        upload_speed,
+        speed_ratio_to_advertised
+    ) VALUES (
+        '$PRIMARY_INTERFACE',
+        $download,
+        $upload,
+        $download_ratio
+    );
 EOF
-    } catch {
-        log_error "Failed to collect bandwidth metrics on $PRIMARY_INTERFACE: $ex"
-    }
+    if [ $? -ne 0 ]; then
+        log_error "Failed to insert bandwidth metrics into database"
+        return 1
+    fi
 }
 
 # Latency Measurements
 collect_latency_metrics() {
     for server in "${TEST_SERVERS[@]}"; do
-        try {
-            # Collect detailed ping statistics
-            ping_result=$(ping -c 10 -i 0.2 "$server" 2>/dev/null)
-            if [ $? -ne 0 ]; then
-                throw "Ping to $server failed"
-            }
-            
-            rtt_avg=$(echo "$ping_result" | awk -F '/' 'END {print $5}')
-            rtt_min=$(echo "$ping_result" | awk -F '/' 'END {print $4}')
-            rtt_max=$(echo "$ping_result" | awk -F '/' 'END {print $6}')
-            
-            # Calculate jitter
-            jitter=$(echo "$ping_result" | awk -F '=' '/rtt/ {split($2,a,"/"); print a[3]}')
-            
-            sqlite3 "$DATA_DIR/network_metrics.db" <<EOF
-            INSERT INTO latency_metrics (
-                server,
-                ping_time,
-                jitter,
-                rtt_avg,
-                rtt_min,
-                rtt_max
-            ) VALUES (
-                '$server',
-                $rtt_avg,
-                $jitter,
-                $rtt_avg,
-                $rtt_min,
-                $rtt_max
-            );
+        ping_result=$(ping -c 10 -i 0.2 "$server" 2>/dev/null)
+        if ! handle_error "ping $server"; then
+            log_error "Ping to $server failed"
+            continue
+        fi
+        
+        rtt_avg=$(echo "$ping_result" | awk -F '/' 'END {print $5}')
+        rtt_min=$(echo "$ping_result" | awk -F '/' 'END {print $4}')
+        rtt_max=$(echo "$ping_result" | awk -F '/' 'END {print $6}')
+        
+        # Calculate jitter
+        jitter=$(echo "$ping_result" | awk -F '=' '/rtt/ {split($2,a,"/"); print a[3]}')
+        
+        sqlite3 "$DATA_DIR/network_metrics.db" <<EOF
+        INSERT INTO latency_metrics (
+            server,
+            ping_time,
+            jitter,
+            rtt_avg,
+            rtt_min,
+            rtt_max
+        ) VALUES (
+            '$server',
+            $rtt_avg,
+            $jitter,
+            $rtt_avg,
+            $rtt_min,
+            $rtt_max
+        );
 EOF
-        } catch {
-            log_error "Failed to collect latency metrics for $server: $ex"
-        }
+        if [ $? -ne 0 ]; then
+            log_error "Failed to insert latency metrics for $server into database"
+        fi
     done
 }
 
 # Network Quality Indicators
 collect_network_quality() {
     for interface in "${INTERFACES[@]}"; do
-        try {
-            # Different collection methods for wireless vs ethernet
-            if [[ $interface == wlan* ]]; then
-                # Wireless metrics
-                if command -v iw >/dev/null; then
-                    signal_info=$(iw dev $interface station dump 2>/dev/null)
+        # Different collection methods for wireless vs ethernet
+        if [[ $interface == wlan* ]]; then
+            # Wireless metrics
+            if command -v iw >/dev/null; then
+                signal_info=$(iw dev $interface station dump 2>/dev/null)
+                if [ $? -eq 0 ]; then
                     signal_strength=$(echo "$signal_info" | grep 'signal:' | awk '{print $2}')
                     tx_bitrate=$(echo "$signal_info" | grep 'tx bitrate:' | awk '{print $3}')
                     freq_band=$(iw dev $interface info | grep 'channel' | awk '{print $2}')
@@ -197,61 +197,82 @@ collect_network_quality() {
                     noise_floor=-95  # Typical noise floor in dBm
                     snr=$(( signal_strength - noise_floor ))
                 else
+                    log_error "Failed to get wireless metrics for $interface"
                     signal_strength="NULL"
                     tx_bitrate="NULL"
                     freq_band="NULL"
                     snr="NULL"
                 fi
             else
-                # Ethernet metrics using ethtool
-                if command -v ethtool >/dev/null; then
-                    eth_info=$(ethtool $interface 2>/dev/null)
-                    speed=$(echo "$eth_info" | grep 'Speed:' | awk '{print $2}' | tr -d 'Mb/s')
-                    duplex=$(echo "$eth_info" | grep 'Duplex:' | awk '{print $2}')
-                    
-                    # Use speed as tx_bitrate for ethernet
-                    tx_bitrate=$speed
-                    signal_strength="NULL"  # Not applicable for ethernet
-                    freq_band="NULL"        # Not applicable for ethernet
-                    snr="NULL"              # Not applicable for ethernet
-                fi
+                log_error "iw command not found"
+                signal_strength="NULL"
+                tx_bitrate="NULL"
+                freq_band="NULL"
+                snr="NULL"
             fi
+        else
+            # Ethernet metrics using ethtool
+            if command -v ethtool >/dev/null; then
+                eth_info=$(ethtool $interface 2>/dev/null)
+                if [ $? -eq 0 ]; then
+                    speed=$(echo "$eth_info" | grep 'Speed:' | awk '{print $2}' | tr -d 'Mb/s')
+                    tx_bitrate=$speed
+                else
+                    log_error "Failed to get ethernet metrics for $interface"
+                    speed="NULL"
+                    tx_bitrate="NULL"
+                fi
+                signal_strength="NULL"  # Not applicable for ethernet
+                freq_band="NULL"        # Not applicable for ethernet
+                snr="NULL"              # Not applicable for ethernet
+            else
+                log_error "ethtool command not found"
+                speed="NULL"
+                tx_bitrate="NULL"
+                signal_strength="NULL"
+                freq_band="NULL"
+                snr="NULL"
+            fi
+        fi
 
-            sqlite3 "$DATA_DIR/network_metrics.db" <<EOF
-            INSERT INTO network_quality (
-                interface,
-                signal_strength,
-                snr,
-                freq_band,
-                tx_rate
-            ) VALUES (
-                '$interface',
-                ${signal_strength:-NULL},
-                ${snr:-NULL},
-                '${freq_band:-NULL}',
-                ${tx_bitrate:-NULL}
-            );
+        sqlite3 "$DATA_DIR/network_metrics.db" <<EOF
+        INSERT INTO network_quality (
+            interface,
+            signal_strength,
+            snr,
+            freq_band,
+            tx_rate
+        ) VALUES (
+            '$interface',
+            ${signal_strength:-NULL},
+            ${snr:-NULL},
+            '${freq_band:-NULL}',
+            ${tx_bitrate:-NULL}
+        );
 EOF
-        } catch {
-            log_error "Failed to collect network quality metrics for $interface: $ex"
-        }
+        if [ $? -ne 0 ]; then
+            log_error "Failed to insert network quality metrics for $interface"
+        fi
     done
 }
 
 # Protocol-Specific Metrics Collection
 collect_protocol_metrics() {
-    try {
-        # TCP connection establishment time
-        tcp_connect_time=$(timeout 2 time nc -zv google.com 443 2>&1 | grep 'real' | awk '{print $2}')
-        
-        # TCP retransmission stats using ss
-        tcp_retrans=$(ss -ti | grep -c 'retrans')
-        
-        # DNS resolution times for multiple domains
-        dns_domains=("google.com" "facebook.com" "amazon.com" "microsoft.com")
-        for domain in "${dns_domains[@]}"; do
-            dns_time=$(dig "@8.8.8.8" "$domain" | grep "Query time:" | awk '{print $4}')
-            
+    # TCP connection establishment time
+    tcp_connect_time=$(timeout 2 time nc -zv google.com 443 2>&1 | grep 'real' | awk '{print $2}')
+    if [ $? -ne 0 ]; then
+        log_error "Failed to measure TCP connection time"
+        tcp_connect_time="NULL"
+    fi
+    
+    # TCP retransmission stats
+    tcp_retrans=$(ss -ti | grep -c 'retrans' 2>/dev/null || echo "NULL")
+    
+    # DNS resolution times
+    dns_domains=("google.com" "facebook.com" "amazon.com" "microsoft.com")
+    for domain in "${dns_domains[@]}"; do
+        dns_time=$(dig "@8.8.8.8" "$domain" | grep "Query time:" | awk '{print $4}')
+        if [ $? -eq 0 ]; then
             sqlite3 "$DATA_DIR/network_metrics.db" <<EOF
             INSERT INTO protocol_metrics (
                 timestamp,
@@ -260,15 +281,21 @@ collect_protocol_metrics() {
             ) VALUES (
                 CURRENT_TIMESTAMP,
                 '$domain',
-                $dns_time
+                ${dns_time:-NULL}
             );
 EOF
-        done
+            if [ $? -ne 0 ]; then
+                log_error "Failed to insert DNS metrics for $domain"
+            fi
+        else
+            log_error "Failed to measure DNS resolution time for $domain"
+        fi
+    done
 
-        # HTTP/HTTPS latency measurements
-        for url in "${HTTP_TEST_URLS[@]}"; do
-            http_latency=$(curl -o /dev/null -s -w '%{time_total}\n' "$url")
-            
+    # HTTP/HTTPS latency measurements
+    for url in "${HTTP_TEST_URLS[@]}"; do
+        http_latency=$(curl -o /dev/null -s -w '%{time_total}\n' "$url")
+        if [ $? -eq 0 ]; then
             sqlite3 "$DATA_DIR/network_metrics.db" <<EOF
             INSERT INTO http_metrics (
                 timestamp,
@@ -280,28 +307,32 @@ EOF
                 $http_latency
             );
 EOF
-        done
-    } catch {
-        log_error "Failed to collect protocol metrics: $ex"
-    }
+            if [ $? -ne 0 ]; then
+                log_error "Failed to insert HTTP metrics for $url"
+            fi
+        else
+            log_error "Failed to measure HTTP latency for $url"
+        fi
+    done
 }
 
 # Connection Stability Monitoring
 collect_stability_metrics() {
-    try {
-        # Check current connection status
-        ping -c 1 8.8.8.8 >/dev/null 2>&1
-        current_status=$?
-        
-        # Update connection log
-        echo "$(date '+%Y-%m-%d %H:%M:%S'),$current_status" >> "$DATA_DIR/connection_log.csv"
-        
-        # Calculate stability metrics
+    # Check current connection status
+    ping -c 1 8.8.8.8 >/dev/null 2>&1
+    current_status=$?
+    
+    # Update connection log
+    echo "$(date '+%Y-%m-%d %H:%M:%S'),$current_status" >> "$DATA_DIR/connection_log.csv"
+    
+    # Calculate stability metrics
+    if [ -f "$DATA_DIR/connection_log.csv" ]; then
         total_checks=$(wc -l < "$DATA_DIR/connection_log.csv")
-        failures=$(grep -c ",1" "$DATA_DIR/connection_log.csv")
+        failures=$(grep -c ",1" "$DATA_DIR/connection_log.csv" || echo "0")
         uptime_percentage=$(echo "scale=2; (($total_checks-$failures)/$total_checks)*100" | bc)
         
         # Calculate interruption duration if currently disconnected
+        interruption_duration=0
         if [ $current_status -ne 0 ]; then
             last_success=$(grep ",0" "$DATA_DIR/connection_log.csv" | tail -n 1)
             if [ ! -z "$last_success" ]; then
@@ -320,122 +351,154 @@ collect_stability_metrics() {
             CURRENT_TIMESTAMP,
             $uptime_percentage,
             $current_status,
-            ${interruption_duration:-0}
+            $interruption_duration
         );
 EOF
-    } catch {
-        log_error "Failed to collect stability metrics: $ex"
-    }
+        if [ $? -ne 0 ]; then
+            log_error "Failed to insert stability metrics"
+        fi
+    else
+        log_error "Connection log file not found"
+    fi
 }
 
 # Network Load Characteristics
 collect_load_metrics() {
-    try {
-        # Get current connections count
-        concurrent_connections=$(netstat -an | grep ESTABLISHED | wc -l)
+    # Get current connections count
+    concurrent_connections=$(netstat -an | grep ESTABLISHED | wc -l)
+    if [ $? -ne 0 ]; then
+        log_error "Failed to get connection count"
+        concurrent_connections=0
+    fi
         
-        # Get bandwidth utilization
-        if command -v vnstat >/dev/null; then
-            bandwidth_util=$(vnstat -tr 2 | grep "rx" | awk '{print $2}')
+    # Get bandwidth utilization
+    if command -v vnstat >/dev/null; then
+        bandwidth_util=$(vnstat -tr 2 | grep "rx" | awk '{print $2}')
+        if [ $? -ne 0 ]; then
+            log_error "Failed to get bandwidth utilization"
+            bandwidth_util=0
         fi
+    fi
         
-        # Get interface statistics
-        if command -v ifstat >/dev/null; then
-            interface_stats=$(ifstat -i "$INTERFACE" 1 1)
+    # Get interface statistics
+    if command -v ifstat >/dev/null; then
+        interface_stats=$(ifstat -i "$PRIMARY_INTERFACE" 1 1)
+        if [ $? -eq 0 ]; then
             in_traffic=$(echo "$interface_stats" | tail -n 1 | awk '{print $1}')
             out_traffic=$(echo "$interface_stats" | tail -n 1 | awk '{print $2}')
+        else
+            log_error "Failed to get interface statistics"
+            in_traffic=0
+            out_traffic=0
         fi
+    fi
         
-        sqlite3 "$DATA_DIR/network_metrics.db" <<EOF
-        INSERT INTO load_metrics (
-            timestamp,
-            concurrent_connections,
-            bandwidth_utilization,
-            incoming_traffic,
-            outgoing_traffic
-        ) VALUES (
-            CURRENT_TIMESTAMP,
-            $concurrent_connections,
-            ${bandwidth_util:-0},
-            ${in_traffic:-0},
-            ${out_traffic:-0}
-        );
+    sqlite3 "$DATA_DIR/network_metrics.db" <<EOF
+    INSERT INTO load_metrics (
+        timestamp,
+        concurrent_connections,
+        bandwidth_utilization,
+        incoming_traffic,
+        outgoing_traffic
+    ) VALUES (
+        CURRENT_TIMESTAMP,
+        $concurrent_connections,
+        ${bandwidth_util:-0},
+        ${in_traffic:-0},
+        ${out_traffic:-0}
+    );
 EOF
-    } catch {
-        log_error "Failed to collect load metrics: $ex"
-    }
+    if [ $? -ne 0 ]; then
+        log_error "Failed to insert load metrics"
+    fi
 }
 
 # Advanced Technical Metrics
 collect_advanced_metrics() {
-    try {
-        # MTU size check
-        mtu_size=$(ip link show "$INTERFACE" | grep mtu | awk '{print $5}')
+    # MTU size check
+    mtu_size=$(ip link show "$PRIMARY_INTERFACE" | grep mtu | awk '{print $5}')
+    if [ $? -ne 0 ]; then
+        log_error "Failed to get MTU size"
+        mtu_size=0
+    fi
         
-        # TCP window scaling
-        tcp_window=$(sysctl net.ipv4.tcp_window_scaling | awk '{print $3}')
+    # TCP window scaling
+    tcp_window=$(sysctl net.ipv4.tcp_window_scaling | awk '{print $3}')
+    if [ $? -ne 0 ]; then
+        log_error "Failed to get TCP window scaling"
+        tcp_window=0
+    fi
         
-        # Buffer bloat test using ping under load
-        start_ping=$(ping -c 1 8.8.8.8 | grep 'time=' | awk -F'time=' '{print $2}' | cut -d' ' -f1)
-        dd if=/dev/zero of=/dev/null bs=1M count=100 2>/dev/null & # Generate load
-        load_ping=$(ping -c 1 8.8.8.8 | grep 'time=' | awk -F'time=' '{print $2}' | cut -d' ' -f1)
-        kill $! 2>/dev/null # Stop load
-        bloat_difference=$(echo "$load_ping - $start_ping" | bc)
+    # Buffer bloat test using ping under load
+    start_ping=$(ping -c 1 8.8.8.8 | grep 'time=' | awk -F'time=' '{print $2}' | cut -d' ' -f1)
+    dd if=/dev/zero of=/dev/null bs=1M count=100 2>/dev/null & # Generate load
+    load_ping=$(ping -c 1 8.8.8.8 | grep 'time=' | awk -F'time=' '{print $2}' | cut -d' ' -f1)
+    kill $! 2>/dev/null # Stop load
+    bloat_difference=$(echo "$load_ping - $start_ping" | bc)
         
-        # Congestion control info
-        congestion_control=$(sysctl net.ipv4.tcp_congestion_control | awk '{print $3}')
+    # Congestion control info
+    congestion_control=$(sysctl net.ipv4.tcp_congestion_control | awk '{print $3}')
+    if [ $? -ne 0 ]; then
+        log_error "Failed to get congestion control info"
+        congestion_control="unknown"
+    fi
         
-        sqlite3 "$DATA_DIR/network_metrics.db" <<EOF
-        INSERT INTO advanced_metrics (
-            timestamp,
-            mtu_size,
-            tcp_window_scaling,
-            buffer_bloat,
-            congestion_control
-        ) VALUES (
-            CURRENT_TIMESTAMP,
-            $mtu_size,
-            $tcp_window,
-            $bloat_difference,
-            '$congestion_control'
-        );
+    sqlite3 "$DATA_DIR/network_metrics.db" <<EOF
+    INSERT INTO advanced_metrics (
+        timestamp,
+        mtu_size,
+        tcp_window_scaling,
+        buffer_bloat,
+        congestion_control
+    ) VALUES (
+        CURRENT_TIMESTAMP,
+        $mtu_size,
+        $tcp_window,
+        $bloat_difference,
+        '$congestion_control'
+    );
 EOF
-    } catch {
-        log_error "Failed to collect advanced metrics: $ex"
-    }
+    if [ $? -ne 0 ]; then
+        log_error "Failed to insert advanced metrics"
+    fi
 }
 
 # Security Metrics
 collect_security_metrics() {
-    try {
-        # Check for unusual connection patterns
-        suspicious_connections=$(netstat -an | grep -c "SYN_RECV")
-        
-        # Monitor for port scans
-        potential_scans=$(grep "port scan" /var/log/syslog 2>/dev/null | wc -l)
-        
-        # Check packet errors
-        rx_errors=$(ifconfig "$INTERFACE" | grep "RX errors" | awk '{print $3}')
-        tx_errors=$(ifconfig "$INTERFACE" | grep "TX errors" | awk '{print $3}')
-        
-        sqlite3 "$DATA_DIR/network_metrics.db" <<EOF
-        INSERT INTO security_metrics (
-            timestamp,
-            suspicious_connections,
-            potential_scans,
-            rx_errors,
-            tx_errors
-        ) VALUES (
-            CURRENT_TIMESTAMP,
-            $suspicious_connections,
-            $potential_scans,
-            ${rx_errors:-0},
-            ${tx_errors:-0}
-        );
+    # Check for unusual connection patterns
+    suspicious_connections=$(netstat -an | grep -c "SYN_RECV" || echo "0")
+    
+    # Monitor for port scans
+    potential_scans=$(grep "port scan" /var/log/syslog 2>/dev/null | wc -l || echo "0")
+    
+    # Check packet errors
+    if [ -x "$(command -v ifconfig)" ]; then
+        rx_errors=$(ifconfig "$PRIMARY_INTERFACE" | grep "RX errors" | awk '{print $3}' || echo "0")
+        tx_errors=$(ifconfig "$PRIMARY_INTERFACE" | grep "TX errors" | awk '{print $3}' || echo "0")
+    else
+        rx_errors=0
+        tx_errors=0
+        log_error "ifconfig not found"
+    fi
+    
+    sqlite3 "$DATA_DIR/network_metrics.db" <<EOF
+    INSERT INTO security_metrics (
+        timestamp,
+        suspicious_connections,
+        potential_scans,
+        rx_errors,
+        tx_errors
+    ) VALUES (
+        CURRENT_TIMESTAMP,
+        $suspicious_connections,
+        $potential_scans,
+        $rx_errors,
+        $tx_errors
+    );
 EOF
-    } catch {
-        log_error "Failed to collect security metrics: $ex"
-    }
+    if [ $? -ne 0 ]; then
+        log_error "Failed to insert security metrics"
+    fi
 }
 
 # Enhanced interface metrics collection
@@ -592,18 +655,19 @@ main() {
 
 # Export current metrics to JSON for foreground script
 export_current_metrics_json() {
-    try {
-        sqlite3 -json "$DATA_DIR/network_metrics.db" "
-            SELECT * FROM bandwidth_metrics 
-            WHERE timestamp >= datetime('now', '-5 minutes')
-            UNION ALL
-            SELECT * FROM latency_metrics
-            WHERE timestamp >= datetime('now', '-5 minutes')
-            -- Add other tables as needed
-        " > "$DATA_DIR/current_metrics.json"
-    } catch {
-        log_error "Failed to export metrics to JSON: $ex"
-    }
+    sqlite3 -json "$DATA_DIR/network_metrics.db" "
+        SELECT * FROM bandwidth_metrics 
+        WHERE timestamp >= datetime('now', '-5 minutes')
+        UNION ALL
+        SELECT * FROM latency_metrics
+        WHERE timestamp >= datetime('now', '-5 minutes')
+        -- Add other tables as needed
+    " > "$DATA_DIR/current_metrics.json"
+    
+    if [ $? -ne 0 ]; then
+        log_error "Failed to export metrics to JSON"
+        return 1
+    fi
 }
 
 # Trap signals for clean exit
