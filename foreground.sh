@@ -11,27 +11,44 @@ NC='\033[0m'
 current_display=1
 max_displays=5
 
+log_error() {
+    echo -e "${RED}ERROR: $1${NC}"
+    sleep 2  # Show error briefly
+}
+
 display_bandwidth_metrics() {
     echo -e "${BLUE}=== Bandwidth Metrics ===${NC}"
-    speedtest_result=$(speedtest-cli --simple)
-    echo "$speedtest_result"
+    
+    if ! speedtest_result=$(speedtest-cli --simple); then
+        echo -e "${RED}Failed to get speedtest results${NC}"
+    else
+        echo "$speedtest_result"
+    fi
     
     echo -e "\n${BLUE}Network Load:${NC}"
-    netstat -i | head -n 2
-    netstat -i | grep eth0
+    if ! netstat -i &>/dev/null; then
+        echo -e "${RED}Failed to get network interface statistics${NC}"
+    else
+        netstat -i | head -n 2
+        netstat -i | grep eth0 || echo -e "${RED}eth0 interface not found${NC}"
+    fi
 }
 
 display_latency_metrics() {
     echo -e "${BLUE}=== Latency Metrics ===${NC}"
+    
     echo -e "${YELLOW}Local Ping (Gateway):${NC}"
-    gateway=$(ip route | grep default | awk '{print $3}')
-    ping -c 3 $gateway | tail -n 1
+    if ! gateway=$(ip route | grep default | awk '{print $3}'); then
+        echo -e "${RED}Failed to determine gateway${NC}"
+    else
+        ping -c 3 $gateway | tail -n 1 || echo -e "${RED}Failed to ping gateway${NC}"
+    fi
     
     echo -e "\n${YELLOW}Remote Ping (Google DNS):${NC}"
-    ping -c 3 8.8.8.8 | tail -n 1
+    ping -c 3 8.8.8.8 | tail -n 1 || echo -e "${RED}Failed to ping Google DNS${NC}"
     
     echo -e "\n${YELLOW}Average RTT:${NC}"
-    mtr -n --report 8.8.8.8 | tail -n 1
+    mtr -n --report 8.8.8.8 | tail -n 1 || echo -e "${RED}Failed to get MTR report${NC}"
 }
 
 display_connection_stability() {
@@ -64,11 +81,11 @@ rotate_display() {
     echo -e "Display $current_display of $max_displays\n"
     
     case $current_display in
-        1) display_bandwidth_metrics ;;
-        2) display_latency_metrics ;;
-        3) display_connection_stability ;;
-        4) display_routing_metrics ;;
-        5) display_protocol_metrics ;;
+        1) display_bandwidth_metrics || log_error "Failed to display bandwidth metrics" ;;
+        2) display_latency_metrics || log_error "Failed to display latency metrics" ;;
+        3) display_connection_stability || log_error "Failed to display connection stability" ;;
+        4) display_routing_metrics || log_error "Failed to display routing metrics" ;;
+        5) display_protocol_metrics || log_error "Failed to display protocol metrics" ;;
     esac
     
     current_display=$((current_display % max_displays + 1))
