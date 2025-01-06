@@ -8,6 +8,16 @@ mkdir -p "$JSON_DIR"
 # Initialize SQLite database
 DB_FILE="$DATA_DIR/network_metrics.db"
 
+# Add at the start of the script
+LOG_DIR="$DATA_DIR/logs"
+mkdir -p "$LOG_DIR"
+ERROR_LOG="$LOG_DIR/error.log"
+
+log_error() {
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] $1" >> "$ERROR_LOG"
+}
+
 init_database() {
     sqlite3 "$DB_FILE" <<EOF
     CREATE TABLE IF NOT EXISTS bandwidth_metrics (
@@ -49,15 +59,42 @@ EOF
 }
 
 collect_bandwidth_metrics() {
-    speedtest_result=$(speedtest-cli --json)
-    echo "$speedtest_result" >> "$JSON_DIR/bandwidth_metrics.json"
-    
-    download_speed=$(echo "$speedtest_result" | jq '.download')
-    upload_speed=$(echo "$speedtest_result" | jq '.upload')
-    packet_loss=$(ping -c 10 8.8.8.8 | grep "packet loss" | awk '{print $6}' | tr -d '%')
-    
-    sqlite3 "$DB_FILE" "INSERT INTO bandwidth_metrics (download_speed, upload_speed, packet_loss) 
-                        VALUES ($download_speed, $upload_speed, $packet_loss);"
+    # Wrap in try-catch style error handling
+    {
+        speedtest_result=$(speedtest-cli --json) || {
+            log_error "Failed to run speedtest-cli"
+            return 1
+        }
+        
+        echo "$speedtest_result" >> "$JSON_DIR/bandwidth_metrics.json" || {
+            log_error "Failed to write bandwidth JSON"
+            return 1
+        }
+        
+        download_speed=$(echo "$speedtest_result" | jq '.download') || {
+            log_error "Failed to parse download speed"
+            return 1
+        }
+        
+        upload_speed=$(echo "$speedtest_result" | jq '.upload') || {
+            log_error "Failed to parse upload speed"
+            return 1
+        }
+        
+        packet_loss=$(ping -c 10 8.8.8.8 | grep "packet loss" | awk '{print $6}' | tr -d '%') || {
+            log_error "Failed to measure packet loss"
+            return 1
+        }
+        
+        sqlite3 "$DB_FILE" "INSERT INTO bandwidth_metrics (download_speed, upload_speed, packet_loss) 
+                           VALUES ($download_speed, $upload_speed, $packet_loss);" || {
+            log_error "Failed to insert bandwidth metrics into SQLite"
+            return 1
+        }
+    } || {
+        log_error "Bandwidth metrics collection failed"
+        return 1
+    }
 }
 
 collect_latency_metrics() {
@@ -97,12 +134,10 @@ collect_protocol_metrics() {
                         VALUES ($tcp_connections, $tcp_retrans, $dns_time);"
 }
 
-# Main collection loop
-init_database
-
+# Main collection loop with error handling
 while true; do
-    collect_bandwidth_metrics
-    collect_latency_metrics
-    collect_protocol_metrics
+    collect_bandwidth_metrics || log_error "Bandwidth metrics collection cycle failed"
+    collect_latency_metrics || log_error "Latency metrics collection cycle failed"
+    collect_protocol_metrics || log_error "Protocol metrics collection cycle failed"
     sleep 300
 done

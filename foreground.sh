@@ -7,16 +7,41 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
 
-# Display rotation counter
-current_display=1
-max_displays=5
+# Terminal control sequences
+SAVE_CURSOR='\033[s'
+RESTORE_CURSOR='\033[u'
+MOVE_TO='\033[%d;%dH'
+
+# Get terminal size
+TERM_ROWS=$(tput lines)
+TERM_COLS=$(tput cols)
+
+# Calculate split screen positions
+LEFT_WIDTH=$((TERM_COLS/2))
+RIGHT_WIDTH=$((TERM_COLS/2))
+TOP_HEIGHT=$((TERM_ROWS/2))
+BOTTOM_HEIGHT=$((TERM_ROWS/2))
 
 log_error() {
-    echo -e "${RED}ERROR: $1${NC}"
-    sleep 2  # Show error briefly
+    local row=$((TERM_ROWS-1))
+    printf "${MOVE_TO}${RED}ERROR: %s${NC}" "$row" 0 "$1"
+    sleep 2
 }
 
-display_bandwidth_metrics() {
+draw_borders() {
+    clear
+    # Draw horizontal line in the middle
+    printf "${MOVE_TO}" $((TOP_HEIGHT)) 0
+    printf '%*s' "$TERM_COLS" '' | tr ' ' '-'
+    
+    # Draw vertical line in the middle
+    for ((i=0; i<TERM_ROWS; i++)); do
+        printf "${MOVE_TO}|" "$i" "$LEFT_WIDTH"
+    done
+}
+
+update_bandwidth_metrics() {
+    printf "${MOVE_TO}" 1 1
     echo -e "${BLUE}=== Bandwidth Metrics ===${NC}"
     
     if ! speedtest_result=$(speedtest-cli --simple); then
@@ -34,7 +59,8 @@ display_bandwidth_metrics() {
     fi
 }
 
-display_latency_metrics() {
+update_latency_metrics() {
+    printf "${MOVE_TO}" 1 $((LEFT_WIDTH+2))
     echo -e "${BLUE}=== Latency Metrics ===${NC}"
     
     echo -e "${YELLOW}Local Ping (Gateway):${NC}"
@@ -46,12 +72,10 @@ display_latency_metrics() {
     
     echo -e "\n${YELLOW}Remote Ping (Google DNS):${NC}"
     ping -c 3 8.8.8.8 | tail -n 1 || echo -e "${RED}Failed to ping Google DNS${NC}"
-    
-    echo -e "\n${YELLOW}Average RTT:${NC}"
-    mtr -n --report 8.8.8.8 | tail -n 1 || echo -e "${RED}Failed to get MTR report${NC}"
 }
 
-display_connection_stability() {
+update_connection_stability() {
+    printf "${MOVE_TO}" $((TOP_HEIGHT+1)) 1
     echo -e "${BLUE}=== Connection Stability ===${NC}"
     echo -e "${YELLOW}Interface Status:${NC}"
     ethtool eth0 | grep "Link detected"
@@ -60,13 +84,17 @@ display_connection_stability() {
     ping -c 10 8.8.8.8 | grep "packet loss"
 }
 
-display_routing_metrics() {
+update_routing_metrics() {
+    printf "${MOVE_TO}" $((TOP_HEIGHT+1)) $((LEFT_WIDTH+2))
     echo -e "${BLUE}=== Routing Performance ===${NC}"
     echo -e "${YELLOW}Path to Google DNS:${NC}"
     traceroute -n -w 1 8.8.8.8 | head -n 5
 }
 
-display_protocol_metrics() {
+update_protocol_metrics() {
+    # Calculate position for protocol metrics (bottom center)
+    local start_row=$((TERM_ROWS-10))
+    printf "${MOVE_TO}" "$start_row" $((LEFT_WIDTH/2))
     echo -e "${BLUE}=== Protocol Metrics ===${NC}"
     echo -e "${YELLOW}TCP Connections:${NC}"
     netstat -tn | grep ESTABLISHED | wc -l
@@ -75,24 +103,34 @@ display_protocol_metrics() {
     ss -s | head -n 3
 }
 
-rotate_display() {
-    clear
-    echo -e "${GREEN}=== Network Performance Monitor ===${NC}"
-    echo -e "Display $current_display of $max_displays\n"
-    
-    case $current_display in
-        1) display_bandwidth_metrics || log_error "Failed to display bandwidth metrics" ;;
-        2) display_latency_metrics || log_error "Failed to display latency metrics" ;;
-        3) display_connection_stability || log_error "Failed to display connection stability" ;;
-        4) display_routing_metrics || log_error "Failed to display routing metrics" ;;
-        5) display_protocol_metrics || log_error "Failed to display protocol metrics" ;;
-    esac
-    
-    current_display=$((current_display % max_displays + 1))
+update_header() {
+    printf "${MOVE_TO}" 0 0
+    echo -e "${GREEN}=== Network Performance Monitor === (Press Ctrl+C to exit)${NC}"
+    echo -e "Last update: $(date '+%Y-%m-%d %H:%M:%S')"
 }
+
+# Trap cleanup for graceful exit
+cleanup() {
+    clear
+    tput cnorm  # Show cursor
+    exit 0
+}
+trap cleanup EXIT
+trap cleanup SIGINT
+trap cleanup SIGTERM
+
+# Initialize display
+tput civis  # Hide cursor
+draw_borders
 
 # Main display loop
 while true; do
-    rotate_display
+    update_header
+    update_bandwidth_metrics &
+    update_latency_metrics &
+    update_connection_stability &
+    update_routing_metrics &
+    update_protocol_metrics &
+    wait
     sleep 5
 done
