@@ -7,31 +7,45 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
 
+# Spinner characters for update indication
+SPINNER=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+spinner_idx=0
+
 # Terminal control sequences
 SAVE_CURSOR='\033[s'
 RESTORE_CURSOR='\033[u'
 MOVE_TO='\033[%d;%dH'
+CLEAR_LINE='\033[K'
 
 # Get terminal size
 TERM_ROWS=$(tput lines)
 TERM_COLS=$(tput cols)
 
 # Calculate split screen positions
-LEFT_WIDTH=$((TERM_COLS/2))
-RIGHT_WIDTH=$((TERM_COLS/2))
+LEFT_WIDTH=$((TERM_COLS/2 - 1))
+RIGHT_START=$((LEFT_WIDTH + 3))
 TOP_HEIGHT=$((TERM_ROWS/2))
-BOTTOM_HEIGHT=$((TERM_ROWS/2))
 
-log_error() {
-    local row=$((TERM_ROWS-1))
-    printf "${MOVE_TO}${RED}ERROR: %s${NC}" "$row" 0 "$1"
-    sleep 2
+get_spinner() {
+    echo "${SPINNER[$((spinner_idx % 10))]}"
+    spinner_idx=$((spinner_idx + 1))
+}
+
+clear_section() {
+    local start_row=$1
+    local start_col=$2
+    local height=$3
+    local width=$4
+    
+    for ((i=0; i<height; i++)); do
+        printf "${MOVE_TO}${CLEAR_LINE}" $((start_row + i)) "$start_col"
+    done
 }
 
 draw_borders() {
     clear
     # Draw horizontal line in the middle
-    printf "${MOVE_TO}" $((TOP_HEIGHT)) 0
+    printf "${MOVE_TO}" "$TOP_HEIGHT" 0
     printf '%*s' "$TERM_COLS" '' | tr ' ' '-'
     
     # Draw vertical line in the middle
@@ -41,66 +55,101 @@ draw_borders() {
 }
 
 update_bandwidth_metrics() {
-    printf "${MOVE_TO}" 1 1
-    echo -e "${BLUE}=== Bandwidth Metrics ===${NC}"
+    local spinner=$(get_spinner)
+    clear_section 1 1 $((TOP_HEIGHT-1)) "$LEFT_WIDTH"
     
+    printf "${MOVE_TO}" 1 1
+    echo -e "${BLUE}=== Bandwidth Metrics === ${YELLOW}$spinner${NC}"
+    
+    # Pre-allocate space with empty lines
+    for ((i=0; i<6; i++)); do
+        printf "${MOVE_TO}%${LEFT_WIDTH}s" $((i+2)) 1 ""
+    done
+    
+    printf "${MOVE_TO}" 2 1
     if ! speedtest_result=$(speedtest-cli --simple); then
         echo -e "${RED}Failed to get speedtest results${NC}"
     else
         echo "$speedtest_result"
     fi
-    
-    echo -e "\n${BLUE}Network Load:${NC}"
-    if ! netstat -i &>/dev/null; then
-        echo -e "${RED}Failed to get network interface statistics${NC}"
-    else
-        netstat -i | head -n 2
-        netstat -i | grep eth0 || echo -e "${RED}eth0 interface not found${NC}"
-    fi
 }
 
 update_latency_metrics() {
-    printf "${MOVE_TO}" 1 $((LEFT_WIDTH+2))
-    echo -e "${BLUE}=== Latency Metrics ===${NC}"
+    local spinner=$(get_spinner)
+    clear_section 1 "$RIGHT_START" $((TOP_HEIGHT-1)) "$LEFT_WIDTH"
     
-    echo -e "${YELLOW}Local Ping (Gateway):${NC}"
+    printf "${MOVE_TO}" 1 "$RIGHT_START"
+    echo -e "${BLUE}=== Latency Metrics === ${YELLOW}$spinner${NC}"
+    
+    # Pre-allocate space
+    for ((i=0; i<6; i++)); do
+        printf "${MOVE_TO}%${LEFT_WIDTH}s" $((i+2)) "$RIGHT_START" ""
+    done
+    
+    printf "${MOVE_TO}" 2 "$RIGHT_START"
     if ! gateway=$(ip route | grep default | awk '{print $3}'); then
         echo -e "${RED}Failed to determine gateway${NC}"
     else
-        ping -c 3 $gateway | tail -n 1 || echo -e "${RED}Failed to ping gateway${NC}"
+        echo -e "${YELLOW}Local Ping (Gateway):${NC}"
+        ping -c 1 "$gateway" | tail -n 1
+        echo -e "\n${YELLOW}Remote Ping (Google DNS):${NC}"
+        ping -c 1 8.8.8.8 | tail -n 1
     fi
-    
-    echo -e "\n${YELLOW}Remote Ping (Google DNS):${NC}"
-    ping -c 3 8.8.8.8 | tail -n 1 || echo -e "${RED}Failed to ping Google DNS${NC}"
 }
 
 update_connection_stability() {
+    local spinner=$(get_spinner)
+    clear_section $((TOP_HEIGHT+1)) 1 $((TERM_ROWS-TOP_HEIGHT-2)) "$LEFT_WIDTH"
+    
     printf "${MOVE_TO}" $((TOP_HEIGHT+1)) 1
-    echo -e "${BLUE}=== Connection Stability ===${NC}"
+    echo -e "${BLUE}=== Connection Stability === ${YELLOW}$spinner${NC}"
+    
+    # Pre-allocate space
+    for ((i=0; i<6; i++)); do
+        printf "${MOVE_TO}%${LEFT_WIDTH}s" $((TOP_HEIGHT+2+i)) 1 ""
+    done
+    
+    printf "${MOVE_TO}" $((TOP_HEIGHT+2)) 1
     echo -e "${YELLOW}Interface Status:${NC}"
     ethtool eth0 | grep "Link detected"
-    
     echo -e "\n${YELLOW}Packet Loss Test:${NC}"
-    ping -c 10 8.8.8.8 | grep "packet loss"
+    ping -c 3 8.8.8.8 | grep "packet loss"
 }
 
 update_routing_metrics() {
-    printf "${MOVE_TO}" $((TOP_HEIGHT+1)) $((LEFT_WIDTH+2))
-    echo -e "${BLUE}=== Routing Performance ===${NC}"
+    local spinner=$(get_spinner)
+    clear_section $((TOP_HEIGHT+1)) "$RIGHT_START" $((TERM_ROWS-TOP_HEIGHT-2)) "$LEFT_WIDTH"
+    
+    printf "${MOVE_TO}" $((TOP_HEIGHT+1)) "$RIGHT_START"
+    echo -e "${BLUE}=== Routing Performance === ${YELLOW}$spinner${NC}"
+    
+    # Pre-allocate space
+    for ((i=0; i<6; i++)); do
+        printf "${MOVE_TO}%${LEFT_WIDTH}s" $((TOP_HEIGHT+2+i)) "$RIGHT_START" ""
+    done
+    
+    printf "${MOVE_TO}" $((TOP_HEIGHT+2)) "$RIGHT_START"
     echo -e "${YELLOW}Path to Google DNS:${NC}"
-    traceroute -n -w 1 8.8.8.8 | head -n 5
+    traceroute -n -w 1 8.8.8.8 | head -n 4
 }
 
 update_protocol_metrics() {
-    # Calculate position for protocol metrics (bottom center)
-    local start_row=$((TERM_ROWS-10))
-    printf "${MOVE_TO}" "$start_row" $((LEFT_WIDTH/2))
-    echo -e "${BLUE}=== Protocol Metrics ===${NC}"
-    echo -e "${YELLOW}TCP Connections:${NC}"
-    netstat -tn | grep ESTABLISHED | wc -l
+    local spinner=$(get_spinner)
+    local start_row=$((TERM_ROWS-8))
+    clear_section "$start_row" $((TERM_COLS/4)) 6 $((TERM_COLS/2))
     
-    echo -e "\n${YELLOW}Current Connections:${NC}"
-    ss -s | head -n 3
+    printf "${MOVE_TO}" "$start_row" $((TERM_COLS/4))
+    echo -e "${BLUE}=== Protocol Metrics === ${YELLOW}$spinner${NC}"
+    
+    # Pre-allocate space
+    for ((i=0; i<4; i++)); do
+        printf "${MOVE_TO}%${TERM_COLS/2}s" $((start_row+1+i)) $((TERM_COLS/4)) ""
+    done
+    
+    printf "${MOVE_TO}" $((start_row+1)) $((TERM_COLS/4))
+    echo -e "${YELLOW}TCP Connections:${NC} $(netstat -tn | grep ESTABLISHED | wc -l)"
+    echo -e "${YELLOW}Current Connections:${NC}"
+    ss -s | head -n 2
 }
 
 update_header() {
