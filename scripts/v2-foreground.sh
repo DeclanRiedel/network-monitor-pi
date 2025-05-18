@@ -1,8 +1,20 @@
 #!/bin/bash
 
-start_time=$(date +%s)
+# Save original terminal settings & ensure cleanup on exit
+cleanup() {
+    tput cnorm        # Restore cursor
+    stty "$saved_stty"
+    tput sgr0
+    clear
+    exit
+}
+trap cleanup INT TERM
 
-clear  # Clear screen before drawing
+saved_stty=$(stty -g)
+stty -echo -icanon time 0 min 0  # Disable input echo and buffering
+tput civis                      # Hide cursor
+
+clear
 
 # Terminal dimensions
 rows=$(tput lines)
@@ -39,10 +51,10 @@ sec2_w=$((cols / 4))
 sec3_w=$((cols / 4))
 sec4_w=$((cols - sec1_w - sec2_w - sec3_w - 6))
 sec_h=$((rows / 2 - 2))
-graph_h=$((rows - sec_h - 6))
+graph_h=$((rows - sec_h - 7))  # leave one line for title
 
 # Margins
-top_margin=2
+top_margin=3
 left_margin=2
 
 # Box drawing function (instant)
@@ -61,37 +73,31 @@ draw_box() {
     done
 }
 
-# Draw internal sections
+# Draw internal boxes
 draw_box $top_margin $left_margin $sec_h $sec1_w
 draw_box $top_margin $((left_margin + sec1_w + 1)) $sec_h $sec2_w
 draw_box $top_margin $((left_margin + sec1_w + sec2_w + 2)) $sec_h $sec3_w
-draw_box $top_margin $((left_margin + sec1_w + sec2_w + sec3_w + 3)) $((rows - 4)) $sec4_w
+draw_box $top_margin $((left_margin + sec1_w + sec2_w + sec3_w + 3)) $((rows - 5)) $sec4_w
 draw_box $((top_margin + sec_h + 1)) $left_margin $graph_h $((cols - sec4_w - 6))
 
 # Section labels
-tput ${orange}
-tput cup $top_margin $((left_margin + 2)); echo "# live stats:"
+echo -ne "${orange}"
+tput cup $top_margin $((left_margin + 2)); echo "# live stats"
 tput cup $top_margin $((left_margin + sec1_w + 3)); echo "# connection info"
 tput cup $top_margin $((left_margin + sec1_w + sec2_w + 4)); echo "# averages"
 tput cup $top_margin $((left_margin + sec1_w + sec2_w + sec3_w + 5)); echo "# issues"
 tput cup $((top_margin + sec_h + 1)) $((left_margin + 2)); echo "# graph"
 
-# Title at top center
-tput ${blue}
+# Title (centered between border and boxes)
+echo -ne "${white}"
 title="Network Monitor"
-tput cup 1 $(((cols - ${#title}) / 2)); echo "$title"
+tput cup 2 2
+echo "$title"
 
-# Exit instruction at bottom center
-tput ${white}
-exit_msg="Press Ctrl+C to exit"
-tput cup $((rows - 2)) $(((cols - ${#exit_msg}) / 2)); echo "$exit_msg"
+# Start timer
+start_time=$(date +%s)
 
-# Reset color for runtime display
-tput ${white}
-
-# Show dynamic uptime and background status
-trap "tput sgr0; clear; exit" SIGINT
-
+# Main display loop
 while true; do
     now=$(date +%s)
     elapsed=$((now - start_time))
@@ -99,11 +105,14 @@ while true; do
     mins=$(((elapsed % 3600) / 60))
     secs=$((elapsed % 60))
 
-    uptime=$(printf "Session uptime: %02d:%02d:%02d" $hrs $mins $secs)
+    uptime_text=$(printf "Session uptime: %02d:%02d:%02d" $hrs $mins $secs)
     background="Background script running: false"
+    status_line="$uptime_text    |    $background    |    Press Ctrl+C to exit"
 
+    echo -ne "${white}"
     tput cup $((rows - 2)) 2
-    printf "%s | %s" "$uptime" "$background"
+    #tput cup $((rows - 2)) $(((cols - ${#status_line}) ))
+    echo "$status_line"
 
     sleep 1
 done
