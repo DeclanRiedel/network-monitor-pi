@@ -1,0 +1,26 @@
+## Overall breakdown
+
+there will be a foreground and background script running independetly. The foreground script will contain a cli with potentially ncurses and the background script will run with no cli and record the data to a sqlite3 database.
+
+### Dependencies:
+
+sqlite3, ping, 
+
+
+# checklists: foreground/background
+
+## Foreground script checklist.
+- [ ] ping
+- [ ] jitter
+- [ ] download speed
+- [ ] upload speed
+- [ ] packet loss
+- [ ] retransmissions
+- [ ] RTT
+- [ ] TCP Conn time
+- [ ] DNS Lookup time
+- [ ] TLS Handshake time
+- [ ] session duration, record connection drops counter
+- [ ] 
+
+## Background script checklist.
