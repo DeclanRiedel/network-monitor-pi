@@ -23,4 +23,17 @@ sqlite3, ping,
 - [ ] session duration, record connection drops counter
 - [ ] 
 
+### live panel:
+- ping
+- jitter
+-  packet loss
+- download
+- upload
+- RSSI (if connected)
+- cpu load
+- memory usage
+- ps aux
+
+
+
 ## Background script checklist.
