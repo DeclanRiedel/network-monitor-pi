@@ -1,5 +1,0 @@
-tmux curl git nvim
-
-sqlite3
-
-

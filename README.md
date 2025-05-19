@@ -34,6 +34,18 @@ sqlite3, ping,
 - memory usage
 - ps aux
 
+## tput
+
+| Code | Color   |
+| ---- | ------- |
+| 0    | Black   |
+| 1    | Red     |
+| 2    | Green   |
+| 3    | Yellow  |
+| 4    | Blue    |
+| 5    | Magenta |
+| 6    | Cyan    |
+| 7    | White   |
 
 
 ## Background script checklist.
