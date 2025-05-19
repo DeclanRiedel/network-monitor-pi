@@ -3,6 +3,10 @@
 # At the top of your script
 trap "echo 'Cleaning up...'; kill 0; exit" INT TERM EXIT
 
+# Create a lockfile for safe terminal drawing
+lockfile="/tmp/term-draw.lock"
+touch "$lockfile"
+
 # Save original terminal settings & ensure cleanup on exit
 cleanup() {
     tput cnorm        # Restore cursor
@@ -110,6 +114,8 @@ start_time=$(date +%s)
 #wait Main display loop + static border
 (
 while true; do
+{
+flock 200	
     now=$(date +%s)
     elapsed=$((now - start_time))
     hrs=$((elapsed / 3600))
@@ -125,15 +131,18 @@ while true; do
     #tput cup $((rows - 2)) $(((cols - ${#status_line}) ))
     echo "$status_line"
 
+} 200>"$lockfile"
     sleep 1
+
 done
 ) &
 
 
-# live stats panel 
+# live stats panel - ping, jitter, packetloss  
 (
 while true; do
-    ping_val=$(ping -c1 -W1 1.1.1.1 | grep 'time=' | sed -E 's/.*time=([0-9.]+).*/\1 ms/')
+{ flock 200
+    ping_val=$(ping -c1 -W1 1.1.1.1 | grep 'time=' | sed -E 's/.*time=([0-9.]+).*/\1/')
     jitter_val=$(ping -c 5 -i 0.2 1.1.1.1 | grep 'time=' | awk -F'time=' '{print $2}' | awk '{print $1}' | awk '{sum+=$1; sumsq+=$1*$1} END {n=NR; if (n>1) {mean=sum/n; stddev=sqrt(sumsq/n - mean^2); printf "%.2f\n", stddev} else {print "N/A"}}')
     loss_val=$(ping -c 4 -W1 1.1.1.1 | grep -oP '\d+(?=% packet loss)')
 
@@ -146,18 +155,105 @@ while true; do
         color_packloss=$red
     fi
 
-      tput cup $((live_stats_top)) $live_stats_left
-    printf "ping:   %-6s" "${ping_val:-N/A}"
+     # Color for ping
+    if [[ "$ping_val" == "N/A" ]]; then
+        color_ping=$white
+    elif (( $(echo "$ping_val > 100" | bc -l) )); then
+        color_ping=$red
+    elif (( $(echo "$ping_val > 30" | bc -l) )); then
+        color_ping=$yellow
+    else
+        color_ping=$green
+    fi
+
+    # Color for jitter
+    if [[ "$jitter_val" == "N/A" ]]; then
+        color_jitter=$white
+    elif (( $(echo "$jitter_val > 30" | bc -l) )); then
+        color_jitter=$red
+    elif (( $(echo "$jitter_val > 10" | bc -l) )); then
+        color_jitter=$yellow
+    else
+        color_jitter=$green
+    fi
+
+    tput cup $((live_stats_top)) $live_stats_left
+    echo -ne "ping:   ${color_ping}$(printf %-6s "$ping_val") ms${reset}"
 
     tput cup $((live_stats_top + 1)) $live_stats_left
-    printf "jitter: %-6s" "${jitter_val}ms"  
-
+    echo -ne "jitter: ${color_jitter}$(printf %-6s "$jitter_val") ms${reset}"
+    
     tput cup $((live_stats_top + 2)) $live_stats_left
     echo -ne "loss:  ${color_packloss}${loss_val}%${reset}"
+
+} 200>"$lockfile"
+
+sleep 0.5
 done 
+) &
+
+(
+while true; do
+	{ flock 200
+    # Download/Upload (dummy values from /proc/net/dev)
+    download=$(awk '/wlan|eth/ {down += $2} END {print down}' /proc/net/dev)
+    upload=$(awk '/wlan|eth/ {up += $10} END {print up}' /proc/net/dev)
+
+    download_kbps=$((download / 1024))
+    upload_kbps=$((upload / 1024))
+
+    # RSSI (Wi-Fi signal strength)
+    rssi=$(iwconfig 2>/dev/null | grep -i --color=never 'Signal level' | sed -n 's/.*Signal level=\([-0-9]*\).*/\1/p')
+
+    # CPU Load
+    cpu_load=$(awk '{print $1}' /proc/loadavg)
+
+    # Memory Usage
+    mem_usage=$(free -m | awk '/Mem:/ {printf "%.0f", ($3/$2)*100}')
+
+    # Colors for CPU
+    if (( $(echo "$cpu_load > 2.0" | bc -l) )); then
+        cpu_color=$red
+    elif (( $(echo "$cpu_load > 1.0" | bc -l) )); then
+        cpu_color=$yellow
+    else
+        cpu_color=$green
+    fi
+
+    # Colors for Memory
+    if (( mem_usage > 80 )); then
+        mem_color=$red
+    elif (( mem_usage > 60 )); then
+        mem_color=$yellow
+    else
+        mem_color=$green
+    fi
+
+    # Colors for RSSI
+    if [[ "$rssi" -lt -80 ]]; then
+        rssi_color=$red
+    elif [[ "$rssi" -lt -60 ]]; then
+        rssi_color=$yellow
+    else
+        rssi_color=$green
+    fi
+
+    # Output positions starting from +3
+    tput cup $((live_stats_top + 3)) $live_stats_left
+    echo -ne "Download: ${green}${download_kbps:-0} KB/s${reset}"
+
+    tput cup $((live_stats_top + 4)) $live_stats_left
+    echo -ne "Upload:   ${green}${upload_kbps:-0} KB/s${reset}"
+
+    tput cup $((live_stats_top + 5)) $live_stats_left
+    echo -ne "RSSI:     ${rssi_color}${rssi:-N/A} dBm${reset}"
+
+    tput cup $((live_stats_top + 6)) $live_stats_left
+    echo -ne "CPU Load: ${cpu_color}${cpu_load}${reset}"
+
+    tput cup $((live_stats_top + 7)) $live_stats_left
+    echo -ne "Memory:   ${mem_color}${mem_usage}%${reset}"
+} 200>"$lockfile"
+    sleep 2
+done
 ) 
-
-
-
-
-
